@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/tabcl/__init__.py
+src/tabcl/cli.py
+src/tabcl/codec.py
+src/tabcl/forest.py
+src/tabcl/mi.py
+src/tabcl.egg-info/PKG-INFO
+src/tabcl.egg-info/SOURCES.txt
+src/tabcl.egg-info/dependency_links.txt
+src/tabcl.egg-info/entry_points.txt
+src/tabcl.egg-info/requires.txt
+src/tabcl.egg-info/top_level.txt
+tests/test_roundtrip.py

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tabcl"
+version = "0.1.0"
+description = "MDL-weighted Chow–Liu compressor using OpenZL"
+authors = [{ name = "EE274 Project" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "networkx>=3.0",
+    "openzl>=0.1.0",
+]
+
+[project.scripts]
+tabcl = "tabcl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
