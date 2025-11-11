@@ -1,7 +1,8 @@
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple, Optional
 import json
 import numpy as np
 import threading
+from collections import Counter
 
 try:
 	import openzl.ext as zl  # type: ignore
@@ -10,11 +11,21 @@ except Exception:
 
 
 def histogram_from_pairs(x: Iterable[Any], y: Iterable[Any]) -> Dict[Tuple[Any, Any], int]:
-	counts: Dict[Tuple[Any, Any], int] = {}
-	for a, b in zip(x, y):
-		k = (a, b)
-		counts[k] = counts.get(k, 0) + 1
-	return counts
+	"""Build histogram of (x, y) pairs. Optimized for large datasets."""
+	# Fast path for numpy arrays - use vectorized operations when possible
+	if isinstance(x, np.ndarray) and isinstance(y, np.ndarray):
+		# For small arrays, Counter is fast enough
+		# For larger arrays, we could use bincount if values are small integers
+		# But for now, use Counter which handles all types well
+		if len(x) < 10000:
+			# Small arrays: convert to list of tuples (Counter is fast)
+			return dict(Counter(zip(x, y)))
+		else:
+			# Larger arrays: use Counter directly on zip (memory efficient)
+			return dict(Counter(zip(x, y)))
+	else:
+		# Non-numpy: use Counter
+		return dict(Counter(zip(x, y)))
 
 
 def _gamma_bits(v: int) -> int:
@@ -24,13 +35,77 @@ def _gamma_bits(v: int) -> int:
 	return 2 * l - 1
 
 
+def _golomb_bits(v: int, m: int) -> int:
+	"""
+	Compute Golomb encoding length in bits for value v with parameter m.
+	Golomb code: unary part + binary part
+	- Unary: floor(v/m) ones + one zero = floor(v/m) + 1 bits
+	- Binary: k bits where k = ceil(log2(m)) for truncated binary or log2(m) for remainder
+	Optimal m ≈ -ln(2)/ln(p) where p is probability parameter
+	"""
+	if v <= 0:
+		return 1
+	if m <= 1:
+		return _gamma_bits(v)  # Fallback to gamma if m too small
+	q = v // m
+	b = int(np.ceil(np.log2(m)))
+	# Truncated binary encoding for remainder
+	rem = v % m
+	if m != (1 << b):
+		# Truncated binary: first 2^b - m values use b-1 bits, rest use b bits
+		bound = (1 << b) - m
+		if rem < bound:
+			binary_bits = b - 1
+		else:
+			binary_bits = b
+	else:
+		binary_bits = b
+	return (q + 1) + binary_bits
+
+
+def _optimal_golomb_m(counts: Dict[Tuple[Any, Any], int]) -> int:
+	"""
+	Estimate optimal Golomb parameter m for counts.
+	For geometric distribution with parameter p, optimal m = ceil(-ln(2) / ln(1-p))
+	We estimate p from mean count or use heuristic.
+	"""
+	if not counts:
+		return 256  # Default
+	all_counts = list(counts.values())
+	if not all_counts:
+		return 256
+	mean_count = np.mean(all_counts)
+	if mean_count < 1:
+		return 256
+	# Heuristic: if mean is large, use larger m; if sparse, use smaller m
+	# Optimal m for geometric with mean μ is approximately 0.693 * μ
+	m_opt = max(1, int(0.693 * mean_count))
+	# Round to nearest power of 2 for simpler implementation
+	# Clamp to reasonable range
+	m_opt = min(max(m_opt, 8), 8192)
+	return m_opt
+
+
 def proxy_model_bits(counts: Dict[Tuple[Any, Any], int]) -> float:
-	m = len(counts)
-	if m == 0:
+	m_hist = len(counts)
+	if m_hist == 0:
 		return 0.0
-	bits = _gamma_bits(m)
-	for (_, _), c in counts.items():
-		bits += _gamma_bits(c + 1)
+	# Use gamma for histogram size, Golomb for counts
+	bits = _gamma_bits(m_hist)
+	# Determine if counts are sparse (many small values) - use Golomb
+	# Otherwise use gamma
+	if m_hist > 0:
+		all_counts = list(counts.values())
+		mean_count = np.mean(all_counts) if all_counts else 1
+		# If mean is small (sparse), Golomb is better
+		if mean_count > 1 and mean_count < 100:  # Sparse regime
+			golomb_m = _optimal_golomb_m(counts)
+			for (_, _), c in counts.items():
+				bits += _golomb_bits(c, golomb_m)
+		else:
+			# Not sparse enough, use gamma
+			for (_, _), c in counts.items():
+				bits += _gamma_bits(c + 1)
 	return float(bits)
 
 
@@ -68,12 +143,23 @@ def _build_delta_numeric_compressor() -> "zl.Compressor":
 		return _build_generic_compressor()
 
 
+# Thread-local compressor cache for MDL cost computation (reuse compressors for speed)
+_compressor_cache = threading.local()
+
+def _get_cached_ace_compressor():
+	"""Get or create a cached ACE compressor for MDL cost computation."""
+	if not hasattr(_compressor_cache, 'ace_compressor'):
+		_compressor_cache.ace_compressor = _build_ace_numeric_compressor()
+	return _compressor_cache.ace_compressor
+
 def openzl_model_bits(counts: Dict[Tuple[Any, Any], int]) -> float:
 	if zl is None:
 		return proxy_model_bits(counts)
 	# Encode histogram as a flat int64 triple array [a0,b0,c0, a1,b1,c1, ...]
 	pairs = list(counts.items())
 	m = len(pairs)
+	if m == 0:
+		return 0.0
 	flat = np.empty(3 * m, dtype=np.int64)
 	k = 0
 	for (a, b), c in pairs:
@@ -81,15 +167,44 @@ def openzl_model_bits(counts: Dict[Tuple[Any, Any], int]) -> float:
 		flat[k] = np.int64(zl.hash_name(str(a))) if hasattr(zl, "hash_name") else np.int64(abs(hash(str(a))) & ((1<<63)-1)); k += 1
 		flat[k] = np.int64(zl.hash_name(str(b))) if hasattr(zl, "hash_name") else np.int64(abs(hash(str(b))) & ((1<<63)-1)); k += 1
 		flat[k] = np.int64(c); k += 1
-	# Compress with ACE-friendly numeric graph
-	c = _build_ace_numeric_compressor()
+	# Use cached compressor for speed (reuse across calls)
+	c = _get_cached_ace_compressor()
 	cctx = zl.CCtx(); cctx.ref_compressor(c); cctx.set_parameter(zl.CParam.FormatVersion, zl.MAX_FORMAT_VERSION)
 	out = cctx.compress([zl.Input(zl.Type.Numeric, flat)])
 	return float(len(out) * 8)
 
 
-def mdl_cost_fn_openzl(x: np.ndarray, y: np.ndarray) -> float:
-	counts = histogram_from_pairs(x, y)
+def mdl_cost_fn_fast(x: np.ndarray, y: np.ndarray, row_sample: Optional[int] = None, seed: int = 0) -> float:
+	"""
+	Fast MDL cost estimation using proxy_model_bits (no OpenZL compression).
+	Use this for forest building where we just need to rank edges.
+	"""
+	if row_sample is not None and row_sample < len(x):
+		rng = np.random.default_rng(seed)
+		idx = rng.choice(len(x), size=row_sample, replace=False)
+		x_sampled = x[idx]
+		y_sampled = y[idx]
+	else:
+		x_sampled = x
+		y_sampled = y
+	counts = histogram_from_pairs(x_sampled, y_sampled)
+	return proxy_model_bits(counts)
+
+
+def mdl_cost_fn_openzl(x: np.ndarray, y: np.ndarray, row_sample: Optional[int] = None, seed: int = 0) -> float:
+	"""
+	Compute MDL cost for pairwise distribution using OpenZL compression.
+	Slower but more accurate. Use for final compression, not for forest building.
+	"""
+	if row_sample is not None and row_sample < len(x):
+		rng = np.random.default_rng(seed)
+		idx = rng.choice(len(x), size=row_sample, replace=False)
+		x_sampled = x[idx]
+		y_sampled = y[idx]
+	else:
+		x_sampled = x
+		y_sampled = y
+	counts = histogram_from_pairs(x_sampled, y_sampled)
 	return openzl_model_bits(counts)
 
 

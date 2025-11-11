@@ -3,6 +3,7 @@ pyproject.toml
 src/tabcl/__init__.py
 src/tabcl/cli.py
 src/tabcl/codec.py
+src/tabcl/conditional.py
 src/tabcl/forest.py
 src/tabcl/mi.py
 src/tabcl.egg-info/PKG-INFO

@@ -40,12 +40,16 @@ def orient_forest(n_cols: int, edges: List[Tuple[int, int, float]]) -> List[int]
 
 def _should_use_ace(arr: np.ndarray, threshold: int = 2048) -> bool:
 	# Use ACE when alphabet is reasonably small
+	# ACE is better for low-cardinality categorical data
 	if arr.size == 0:
 		return True
-	return int(np.unique(arr).size) <= threshold
+	unique_count = int(np.unique(arr).size)
+	# Use ACE if cardinality is low (good for categorical)
+	# For very sparse data (many zeros), delta might be better, but ACE handles it well too
+	return unique_count <= threshold
 
 
-def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], dicts: List[Any], workers: int | None = None, min_bucket: int = 32) -> List[bytes]:
+def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], dicts: List[Any], workers: int | None = None) -> List[bytes]:
 	"""
 	Encode each column:
 	- roots: single numeric frame (ACE if low-cardinality)
@@ -91,10 +95,7 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 			segment = sorted_vals[start:end]
 			prefer_delta = dicts[j] is None
 			use_ace = False if prefer_delta else _should_use_ace(segment)
-			if segment.size < min_bucket and not prefer_delta:
-				fb = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=False)
-			else:
-				fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
+			fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
 			parts.append(int(pid).to_bytes(8, "little", signed=True))
 			parts.append(len(fb).to_bytes(8, "little", signed=False))
 			parts.append(fb)
@@ -148,17 +149,26 @@ def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows:
 				fb = frame[ptr:ptr+flen]; ptr += flen
 				vals = decompress_numeric_array(fb).tolist()
 				bucket_data[pid] = vals
-			out = np.empty(n_rows, dtype=np.int64)
+			
+			# Reconstruct in sorted order, then unsort
+			# Values in buckets are in sorted-by-parent-ID order
+			pids_sorted = np.sort(parent_ids.astype(np.int64, copy=False))
+			order_sorted = np.argsort(parent_ids.astype(np.int64, copy=False))
+			out_sorted = np.empty(n_rows, dtype=np.int64)
 			cursors: Dict[int, int] = {pid: 0 for pid in bucket_data.keys()}
 			for i in range(n_rows):
-				pid = int(parent_ids[i])
+				pid = int(pids_sorted[i])
 				vals = bucket_data.get(pid, [])
 				k = cursors.get(pid, 0)
 				if k >= len(vals):
-					out[i] = 0
+					out_sorted[i] = 0
 				else:
-					out[i] = vals[k]
+					out_sorted[i] = vals[k]
 					cursors[pid] = k + 1
+			
+			# Unsort to restore original order
+			out = np.empty(n_rows, dtype=np.int64)
+			out[order_sorted] = out_sorted
 			indices[j] = out
 			undecoded.discard(j)
 			progress = True
