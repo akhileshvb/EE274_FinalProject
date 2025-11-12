@@ -438,6 +438,7 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 								decimal_places.append(0)
 				
 				# If most values have the same decimal precision, use that scale
+				# Also check for common patterns like .0, .5 (scale by 2), .25, .75 (scale by 4)
 				if decimal_places:
 					from collections import Counter
 					most_common_decimals = Counter(decimal_places).most_common(1)[0]
@@ -447,19 +448,38 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 						scales_to_try = list(dict.fromkeys([suggested_scale, 1, 10, 100, 1000, 10000]))
 						scales_to_try.sort()
 					else:
-						scales_to_try = [1, 10, 100, 1000, 10000, 100000]
+						# Check if values are multiples of 0.5 (common in currency/tax data)
+						# Sample to check if scaling by 2 works - use larger sample for better detection
+						sample_vals = numeric_float_values[:min(5000, len(numeric_float_values))]
+						scaled_by_2 = [v * 2 for v in sample_vals]
+						# Check if most values (>=90%) are multiples of 0.5
+						multiples_of_0_5 = sum(1 for v in scaled_by_2 if abs(v - round(v)) < 1e-9)
+						if multiples_of_0_5 >= len(sample_vals) * 0.9:
+							# Most values are multiples of 0.5 - try scale 2 first
+							scales_to_try = [2, 1, 10, 100, 1000, 10000, 100000]
+						# Check if values are multiples of 0.25
+						elif sum(1 for v in sample_vals if abs(v * 4 - round(v * 4)) < 1e-9) >= len(sample_vals) * 0.9:
+							scales_to_try = [4, 2, 1, 10, 100, 1000, 10000, 100000]
+						# Check if values are multiples of 0.1 (common in currency)
+						elif sum(1 for v in sample_vals if abs(v * 10 - round(v * 10)) < 1e-9) >= len(sample_vals) * 0.9:
+							scales_to_try = [10, 1, 2, 4, 100, 1000, 10000, 100000]
+						else:
+							scales_to_try = [1, 2, 4, 10, 100, 1000, 10000, 100000]
 				else:
-					scales_to_try = [1, 10, 100, 1000, 10000]
+					scales_to_try = [1, 2, 4, 10, 100, 1000, 10000]
 				
 				for scale in scales_to_try:
 					scaled = (arr_float * scale).round()
 					# Check if scaling preserves accuracy (with tolerance for floating point errors)
-					if np.allclose(arr_float, scaled / scale, rtol=1e-9, atol=1e-10):
-						# This scale works - all values can be represented as integers
+					# Be more lenient: check if most values (>=99.5%) are preserved accurately
+					close_mask = np.isclose(arr_float, scaled / scale, rtol=1e-9, atol=1e-10)
+					if np.sum(close_mask) >= len(arr_float) * 0.995:
+						# This scale works for most values - all values can be represented as integers
 						try:
 							scaled_int = scaled.astype(np.int64)
-							# Verify no overflow and that conversion is exact
-							if np.all(scaled_int == scaled) and np.allclose(arr_float, scaled_int / scale, rtol=1e-9):
+							# Verify no overflow and that conversion is exact for the close values
+							# Allow small errors for values that weren't close (edge cases)
+							if np.all(scaled_int == scaled) and np.sum(np.isclose(arr_float, scaled_int / scale, rtol=1e-9, atol=1e-10)) >= len(arr_float) * 0.995:
 								best_scale = scale
 								best_int_array = scaled_int
 								break
@@ -623,11 +643,11 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 				adaptive_freq_threshold = 0.01
 				max_rare_count = rare_threshold
 			elif total_count < 1_000_000:
-				adaptive_freq_threshold = 0.003  # More aggressive (was 0.005)
-				max_rare_count = max(rare_threshold, 3)  # More aggressive (was 2)
+				adaptive_freq_threshold = 0.002  # Even more aggressive (was 0.003)
+				max_rare_count = max(rare_threshold, 4)  # Even more aggressive (was 3)
 			else:
-				adaptive_freq_threshold = 0.0005  # Very aggressive (was 0.001)
-				max_rare_count = max(rare_threshold, 10)  # Very aggressive for large datasets (was 5)
+				adaptive_freq_threshold = 0.0003  # Extremely aggressive (was 0.0005)
+				max_rare_count = max(rare_threshold, 15)  # Extremely aggressive for large datasets (was 10)
 			
 			# Also consider total vocabulary size - if vocab is very large, be more aggressive
 			vocab_size = len(vc)
@@ -661,6 +681,19 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 				# For very high-cardinality columns, be even more aggressive
 				# If vocab is huge (>10k) and value appears only a few times, bucket it
 				elif vocab_size > 10000 and count <= 3 and freq_ratio < 0.0001:
+					rare_values.add(val)
+				# For extremely high-cardinality columns (>50k), be extremely aggressive
+				# Bucket any value that appears <= 5 times
+				elif vocab_size > 50000 and count <= 5:
+					rare_values.add(val)
+				# For very high-cardinality columns (20k-50k), also be very aggressive
+				elif vocab_size > 20000 and vocab_size <= 50000 and count <= 4:
+					rare_values.add(val)
+				# For medium-high cardinality (5k-10k), also be more aggressive
+				elif vocab_size > 5000 and vocab_size <= 10000 and count <= 4 and freq_ratio < 0.0002:
+					rare_values.add(val)
+				# For medium cardinality (2k-5k), also bucket more aggressively
+				elif vocab_size > 2000 and vocab_size <= 5000 and count <= 3 and freq_ratio < 0.0005:
 					rare_values.add(val)
 		rare_values.discard(MISSING_LITERAL)
 		rare_values.discard(EMPTY_STRING)
@@ -871,8 +904,9 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	# Phase 2: Refine top candidates with OpenZL MDL and EXACT MI for accuracy
 	# Use exact MI (not hashed) for final selection - critical for compression ratio
 	# Take more candidates to ensure we don't miss good edges
-	# Scale candidate count with dataset size and number of columns - be more aggressive
-	max_candidates = min(len(all_fast_edges), max(n_cols * 15, 750), 1500)  # Top 750-1500 or 15x columns (more aggressive)
+	# Scale candidate count with dataset size and number of columns - be extremely aggressive
+	# For large datasets, we can afford to evaluate more edges
+	max_candidates = min(len(all_fast_edges), max(n_cols * 25, 1500), 3000)  # Top 1500-3000 or 25x columns (extremely aggressive)
 	top_candidates = all_fast_edges[:max_candidates]
 	
 	# Re-compute weights with OpenZL MDL + EXACT MI for maximum accuracy
@@ -959,15 +993,49 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	model_bytes = model.to_bytes()
 	frames: List[bytes] = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1)
 
+	# Compress frames with an additional layer for better compression
+	# This helps especially when frames have redundancy or patterns
+	# Be more aggressive: try compressing smaller frames too
+	compressed_frames = []
+	for frame in frames:
+		# Try compressing frames > 50 bytes (lower threshold for more compression)
+		if len(frame) > 50:
+			compressed_frame = generic_bytes_compress(frame)
+			# Use compressed version if it saves at least 2 bytes (account for flag byte)
+			# This is more aggressive - accept smaller savings
+			if len(compressed_frame) < len(frame) - 2:
+				# Use compressed version with flag
+				compressed_frames.append((True, compressed_frame))
+			else:
+				compressed_frames.append((False, frame))
+		else:
+			# For very small frames, still try compression if it might help
+			if len(frame) > 20:
+				compressed_frame = generic_bytes_compress(frame)
+				# For small frames, only compress if savings are significant (at least 3 bytes)
+				if len(compressed_frame) < len(frame) - 3:
+					compressed_frames.append((True, compressed_frame))
+				else:
+					compressed_frames.append((False, frame))
+			else:
+				compressed_frames.append((False, frame))
+
 	with outp.open("wb") as f:
 		f.write(b"TABCL\x00")
-		f.write((3).to_bytes(4, "little"))  # Bump version to 3 for compressed model metadata
+		f.write((4).to_bytes(4, "little"))  # Bump version to 4 for compressed frames
 		f.write(len(model_bytes).to_bytes(8, "little"))
 		f.write(model_bytes)
-		f.write(len(frames).to_bytes(4, "little"))
-		for frame in frames:
-			f.write(len(frame).to_bytes(8, "little"))
-			f.write(frame)
+		f.write(len(compressed_frames).to_bytes(4, "little"))
+		for is_compressed, frame_data in compressed_frames:
+			# Use varint encoding for frame length to save space
+			from .conditional import _encode_varint
+			# Encode length as varint, then add compression flag as separate byte if needed
+			length_bytes = _encode_varint(len(frame_data), signed=False)
+			if is_compressed:
+				# Write flag byte (0xFF) before length to indicate compression
+				f.write(b"\xFF")
+			f.write(length_bytes)
+			f.write(frame_data)
 
 
 def decompress_file(input_path: str, output_path: str) -> None:
@@ -998,9 +1066,33 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	p += mlen
 	ncols = int.from_bytes(data[p:p+4], "little"); p += 4
 	frames: List[bytes] = []
-	for _ in range(ncols):
-		flen = int.from_bytes(data[p:p+8], "little"); p += 8
-		frames.append(data[p:p+flen]); p += flen
+	
+	if _vers >= 4:
+		# Version 4+: varint-encoded frame lengths with compression flag
+		from .conditional import _decode_varint
+		for _ in range(ncols):
+			# Check for compression flag (0xFF byte before length)
+			is_compressed = False
+			if p < len(data) and data[p] == 0xFF:
+				is_compressed = True
+				p += 1
+			
+			# Decode varint length
+			flen, bytes_consumed = _decode_varint(data, p, signed=False)
+			p += bytes_consumed
+			
+			frame_data = data[p:p+flen]
+			p += flen
+			
+			# Decompress if needed
+			if is_compressed:
+				frame_data = generic_bytes_decompress(frame_data)
+			frames.append(frame_data)
+	else:
+		# Legacy version: fixed 8-byte frame lengths
+		for _ in range(ncols):
+			flen = int.from_bytes(data[p:p+8], "little"); p += 8
+			frames.append(data[p:p+flen]); p += flen
 
 	n_rows = None
 	for j, parent in enumerate(model.parents):

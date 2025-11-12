@@ -159,15 +159,58 @@ def _try_all_compression_methods(arr: np.ndarray, dict_info: Any) -> bytes:
 	
 	from .codec import compress_numeric_array_fast
 	
+	# Check for constant or near-constant arrays (very compressible)
+	unique_vals = np.unique(arr)
+	if len(unique_vals) == 1:
+		# Constant array - use generic compression (very efficient for constants)
+		try:
+			return compress_numeric_array_fast(arr, use_ace=False, prefer_delta=False)
+		except Exception:
+			pass
+	
 	# Try different compression strategies - be more aggressive
 	candidates = []
-	unique_count = int(np.unique(arr).size)
+	unique_count = int(unique_vals.size)
+	
+	# Check for sparse arrays (many zeros) - these compress very well
+	zero_count = np.sum(arr == 0)
+	zero_ratio = zero_count / arr.size if arr.size > 0 else 0
+	if zero_ratio > 0.5:
+		# More than 50% zeros - sparse array, generic compression handles this well
+		# But also try ACE if applicable (ACE is good for sparse categorical)
+		if dict_info is not None and not isinstance(dict_info, tuple):
+			try:
+				ace_result = compress_numeric_array_fast(arr, use_ace=True, prefer_delta=False)
+				candidates.append(("ace_sparse", ace_result))
+			except Exception:
+				pass
+		# Generic compression is usually best for sparse numeric
+		try:
+			generic_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=False)
+			candidates.append(("generic_sparse", generic_result))
+		except Exception:
+			pass
+		# If we have sparse candidates, still try other methods but prioritize sparse ones
+		# (Don't return early - let other methods compete)
+	
+	# Check if array has many repeated values (low entropy) - ACE or generic will work well
+	# Use numpy for faster counting (only for reasonable sizes to avoid overhead)
+	is_dominant = False
+	if arr.size > 0 and arr.size < 100000:  # Only check for smaller arrays to avoid overhead
+		# Reuse unique_vals from above, but get counts
+		_, counts = np.unique(arr, return_counts=True)
+		max_count = np.max(counts) if len(counts) > 0 else 0
+		dominant_ratio = max_count / arr.size
+		# If one value dominates (>40% of values), it's highly compressible
+		is_dominant = dominant_ratio > 0.4
 	
 	# Strategy 1: ACE (if applicable) - usually best for low-cardinality categorical
 	# Try ACE more aggressively - it often works well even for higher cardinality
+	# Also good for arrays with dominant values (high repetition)
 	if dict_info is not None and not isinstance(dict_info, tuple):
 		# Try ACE for reasonable cardinality - expand range even more
-		if unique_count <= 32768:  # Increased from 16384 - ACE can handle even more
+		# Also try if there's a dominant value (even with higher cardinality)
+		if unique_count <= 32768 or (is_dominant and unique_count <= 65536):  # Even more aggressive for dominant values
 			try:
 				ace_result = compress_numeric_array_fast(arr, use_ace=True, prefer_delta=False)
 				candidates.append(("ace", ace_result))
@@ -175,7 +218,7 @@ def _try_all_compression_methods(arr: np.ndarray, dict_info: Any) -> bytes:
 				pass
 	
 	# Strategy 2: Delta encoding (good for sequential/numeric data and runs)
-	# Always try delta for numeric columns
+	# Always try delta for numeric columns (including timestamps which are now integers)
 	if dict_info is None or isinstance(dict_info, tuple):
 		try:
 			delta_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True)
@@ -185,7 +228,18 @@ def _try_all_compression_methods(arr: np.ndarray, dict_info: Any) -> bytes:
 	else:
 		# For categorical, try delta more often - it can help even for medium cardinality
 		# Delta encoding compresses runs well (consecutive identical values)
-		if unique_count > 50 or arr.size > 100:  # Lower threshold to try delta more
+		# Be more aggressive: try delta for smaller segments and lower cardinality
+		# Also check if there are many repeated values (runs) - delta is great for that
+		has_runs = False
+		if arr.size > 1:
+			# Check for runs of identical consecutive values
+			diffs = np.diff(arr)
+			zero_diffs = np.sum(diffs == 0)
+			# If >20% of values are part of runs, delta will help
+			if zero_diffs > arr.size * 0.2:
+				has_runs = True
+		
+		if unique_count > 20 or arr.size > 30 or has_runs:  # Even more aggressive
 			try:
 				delta_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True)
 				candidates.append(("delta", delta_result))
@@ -224,11 +278,11 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 		# For root columns, try all compression methods and pick the best
 		# This is worth it since roots are larger and compression quality matters more
 		# Lower threshold to get better compression on more roots
-		if arr.size > 30:  # Lowered threshold: try all methods for roots > 30 elements
+		if arr.size > 10:  # Lowered threshold even more: try all methods for roots > 10 elements
 			frames[j] = _try_all_compression_methods(arr, dicts[j])
 		else:
 			# For smaller arrays, still try multiple methods to pick the best
-			if arr.size > 8:
+			if arr.size > 3:  # Lowered threshold: try multiple methods for roots > 3
 				# Try ACE (if applicable) and delta/generic, pick best
 				candidates = []
 				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
@@ -250,7 +304,7 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 						pass
 				elif dicts[j] is not None and not isinstance(dicts[j], tuple):
 					unique_count = int(np.unique(arr).size)
-					if unique_count > 30:  # Lower threshold to try delta more
+					if unique_count > 20:  # Lower threshold further to try delta more
 						try:
 							candidates.append(compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True))
 						except Exception:
@@ -316,11 +370,11 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 			
 			# Choose compression method based on segment size
 			# For better compression, try all methods for larger segments
-			# Be more aggressive - try all methods for more segments
-			if segment.size > 8:  # Lowered threshold: try all methods for segments > 8
+			# Be extremely aggressive - try all methods for even smaller segments
+			if segment.size > 3:  # Try all methods for segments > 3 (very aggressive)
 				# For larger segments, try all compression methods (worth the cost for better compression)
 				fb = _try_all_compression_methods(segment, dicts[j])
-			elif segment.size > 3:
+			elif segment.size > 1:
 				# For medium segments (4-10), try ACE and delta/generic, pick best
 				candidates = []
 				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
@@ -336,7 +390,43 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 							pass
 				
 				# Try delta if numeric or medium/high cardinality
-				if prefer_delta_base or (dicts[j] is not None and not isinstance(dicts[j], tuple) and int(np.unique(segment).size) > 30):  # Lower threshold
+				# Be more aggressive: try delta for lower cardinality and smaller segments
+				if prefer_delta_base or (dicts[j] is not None and not isinstance(dicts[j], tuple) and int(np.unique(segment).size) > 20):  # Lower threshold further
+					try:
+						delta_result = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=True)
+						candidates.append(delta_result)
+					except Exception:
+						pass
+				
+				# Always try generic
+				try:
+					generic_result = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=False)
+					candidates.append(generic_result)
+				except Exception:
+					pass
+				
+				if candidates:
+					candidates.sort(key=len)
+					fb = candidates[0]
+				else:
+					# Fallback
+					use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
+					fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
+			elif segment.size > 1:
+				# For very small segments (2-3), still try multiple methods for best compression
+				candidates = []
+				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
+				
+				# Try ACE if applicable
+				if dicts[j] is not None and not isinstance(dicts[j], tuple):
+					try:
+						ace_result = compress_numeric_array_fast(segment, use_ace=True, prefer_delta=False)
+						candidates.append(ace_result)
+					except Exception:
+						pass
+				
+				# Try delta if numeric
+				if prefer_delta_base:
 					try:
 						delta_result = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=True)
 						candidates.append(delta_result)
@@ -358,7 +448,7 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 					use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
 					fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
 			else:
-				# For very small segments (<=3), use heuristic (fast)
+				# Single element - just compress it
 				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
 				use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
 				fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
