@@ -9,6 +9,67 @@ from .codec import (
 )
 
 
+def _encode_varint(value: int, signed: bool = False) -> bytes:
+	"""
+	Encode an integer as a variable-length byte sequence.
+	Format: 7 bits per byte, MSB indicates continuation (1=more bytes, 0=last byte)
+	If signed=True, uses zigzag encoding to support negative values.
+	"""
+	if not signed and value < 0:
+		raise ValueError("Varint encoding only supports non-negative integers when signed=False")
+	
+	# Apply zigzag encoding for signed values (both positive and negative)
+	if signed:
+		# Zigzag encoding: 
+		# - positive values become even numbers (value * 2)
+		# - negative values become odd numbers (abs(value) * 2 - 1)
+		# Formula: (value << 1) ^ (value >> 63) for 64-bit integers
+		value = (value << 1) ^ (value >> 63)
+	
+	result = []
+	# Encode value (which is now non-negative after zigzag if signed)
+	uvalue = value & 0xFFFFFFFFFFFFFFFF  # Ensure unsigned (treat as unsigned for encoding)
+	while uvalue >= 0x80:
+		result.append((uvalue & 0x7F) | 0x80)
+		uvalue >>= 7
+	result.append(uvalue & 0x7F)
+	return bytes(result)
+
+
+def _decode_varint(data: bytes, offset: int, signed: bool = False) -> Tuple[int, int]:
+	"""
+	Decode a variable-length integer from bytes.
+	Returns (value, bytes_consumed)
+	If signed=True, decodes zigzag-encoded values.
+	"""
+	result = 0
+	shift = 0
+	bytes_consumed = 0
+	pos = offset
+	
+	while pos < len(data):
+		byte = data[pos]
+		result |= (byte & 0x7F) << shift
+		bytes_consumed += 1
+		pos += 1
+		if (byte & 0x80) == 0:
+			break
+		shift += 7
+		if shift >= 64:
+			raise ValueError("Varint too long")
+	
+	# Zigzag decoding for signed values
+	if signed:
+		if result & 1:
+			# Odd number means negative
+			result = ~(result >> 1)
+		else:
+			# Even number means positive
+			result = result >> 1
+	
+	return (result, bytes_consumed)
+
+
 def orient_forest(n_cols: int, edges: List[Tuple[int, int, float]]) -> List[int]:
 	"""
 	Orient an undirected forest into parents array.
@@ -49,6 +110,105 @@ def _should_use_ace(arr: np.ndarray, threshold: int = 2048) -> bool:
 	return unique_count <= threshold
 
 
+def _choose_best_compression(arr: np.ndarray, dict_info: Any, prefer_delta: bool = False) -> Tuple[bool, bool]:
+	"""
+	Choose the best compression method for a segment.
+	Returns (use_ace, prefer_delta)
+	"""
+	if arr.size == 0:
+		return (False, False)
+	
+	# For numeric columns (dict_info is None or tuple), prefer delta if values are sequential
+	if prefer_delta or dict_info is None or isinstance(dict_info, tuple):
+		# Check if delta encoding would be beneficial
+		# Delta is good for sequential/smooth data
+		if arr.size > 10:
+			# Check if values are mostly sequential or have small deltas
+			diffs = np.diff(np.sort(arr))
+			if len(diffs) > 0:
+				mean_diff = np.mean(diffs[diffs > 0]) if np.any(diffs > 0) else 0
+				# If differences are small and consistent, delta is better
+				if mean_diff > 0 and mean_diff < 1000 and np.std(diffs[diffs > 0]) < mean_diff * 2:
+					return (False, True)
+		return (False, prefer_delta)
+	
+	# For categorical data, use ACE if cardinality is low
+	unique_count = int(np.unique(arr).size)
+	cardinality_ratio = unique_count / arr.size if arr.size > 0 else 1.0
+	
+	# ACE is better for low-cardinality data
+	# But if cardinality is very high (>50% unique), delta might be better even for categorical
+	if cardinality_ratio > 0.5:
+		# High cardinality - try delta
+		return (False, True)
+	elif unique_count <= 2048:
+		# Low cardinality - use ACE
+		return (True, False)
+	else:
+		# Medium cardinality - prefer ACE but could use delta
+		return (True, False)
+
+
+def _try_all_compression_methods(arr: np.ndarray, dict_info: Any) -> bytes:
+	"""
+	Try all available compression methods and return the smallest result.
+	This is more expensive but gives better compression.
+	"""
+	if arr.size == 0:
+		return b""
+	
+	from .codec import compress_numeric_array_fast
+	
+	# Try different compression strategies - be more aggressive
+	candidates = []
+	unique_count = int(np.unique(arr).size)
+	
+	# Strategy 1: ACE (if applicable) - usually best for low-cardinality categorical
+	# Try ACE more aggressively - it often works well even for higher cardinality
+	if dict_info is not None and not isinstance(dict_info, tuple):
+		# Try ACE for reasonable cardinality - expand range even more
+		if unique_count <= 32768:  # Increased from 16384 - ACE can handle even more
+			try:
+				ace_result = compress_numeric_array_fast(arr, use_ace=True, prefer_delta=False)
+				candidates.append(("ace", ace_result))
+			except Exception:
+				pass
+	
+	# Strategy 2: Delta encoding (good for sequential/numeric data and runs)
+	# Always try delta for numeric columns
+	if dict_info is None or isinstance(dict_info, tuple):
+		try:
+			delta_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True)
+			candidates.append(("delta", delta_result))
+		except Exception:
+			pass
+	else:
+		# For categorical, try delta more often - it can help even for medium cardinality
+		# Delta encoding compresses runs well (consecutive identical values)
+		if unique_count > 50 or arr.size > 100:  # Lower threshold to try delta more
+			try:
+				delta_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True)
+				candidates.append(("delta", delta_result))
+			except Exception:
+				pass
+	
+	# Strategy 3: Generic compression (fallback) - always try this
+	try:
+		generic_result = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=False)
+		candidates.append(("generic", generic_result))
+	except Exception:
+		pass
+	
+	# Return the smallest compression result
+	if not candidates:
+		# Fallback to raw bytes if all compression fails
+		return arr.tobytes(order="C")
+	
+	# Sort by size and return the smallest
+	candidates.sort(key=lambda x: len(x[1]))
+	return candidates[0][1]
+
+
 def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], dicts: List[Any], workers: int | None = None) -> List[bytes]:
 	"""
 	Encode each column:
@@ -61,9 +221,57 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 
 	def encode_root(j: int) -> None:
 		arr = indices[j]
-		prefer_delta = dicts[j] is None
-		use_ace = False if prefer_delta else _should_use_ace(arr)
-		frames[j] = compress_numeric_array_fast(arr, use_ace, prefer_delta=prefer_delta)
+		# For root columns, try all compression methods and pick the best
+		# This is worth it since roots are larger and compression quality matters more
+		# Lower threshold to get better compression on more roots
+		if arr.size > 30:  # Lowered threshold: try all methods for roots > 30 elements
+			frames[j] = _try_all_compression_methods(arr, dicts[j])
+		else:
+			# For smaller arrays, still try multiple methods to pick the best
+			if arr.size > 8:
+				# Try ACE (if applicable) and delta/generic, pick best
+				candidates = []
+				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
+				
+				# Try ACE if applicable (use higher threshold to match _try_all_compression_methods)
+				if dicts[j] is not None and not isinstance(dicts[j], tuple):
+					unique_count = int(np.unique(arr).size)
+					if unique_count <= 32768:  # Match threshold from _try_all_compression_methods
+						try:
+							candidates.append(compress_numeric_array_fast(arr, use_ace=True, prefer_delta=False))
+						except Exception:
+							pass
+				
+				# Try delta if numeric or medium/high cardinality
+				if prefer_delta_base:
+					try:
+						candidates.append(compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True))
+					except Exception:
+						pass
+				elif dicts[j] is not None and not isinstance(dicts[j], tuple):
+					unique_count = int(np.unique(arr).size)
+					if unique_count > 30:  # Lower threshold to try delta more
+						try:
+							candidates.append(compress_numeric_array_fast(arr, use_ace=False, prefer_delta=True))
+						except Exception:
+							pass
+				
+				# Always try generic
+				try:
+					candidates.append(compress_numeric_array_fast(arr, use_ace=False, prefer_delta=False))
+				except Exception:
+					pass
+				
+				if candidates:
+					candidates.sort(key=len)
+					frames[j] = candidates[0]
+				else:
+					frames[j] = compress_numeric_array_fast(arr, use_ace=False, prefer_delta=False)
+			else:
+				# Very small arrays (<=10), use heuristic (faster)
+				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
+				use_ace, prefer_delta = _choose_best_compression(arr, dicts[j], prefer_delta_base)
+				frames[j] = compress_numeric_array_fast(arr, use_ace, prefer_delta=prefer_delta)
 
 	# Encode roots in parallel
 	root_ids = [j for j, p in enumerate(parents) if p == -1]
@@ -89,16 +297,82 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 		parts: List[bytes] = []
 		parts.append(b"CND\x00")
 		parts.append(int(len(uniq)).to_bytes(4, "little", signed=False))
+		
+		# Analyze segment sizes to decide if conditional encoding is worth it
+		# If too many segments are very small, the overhead might not be worth it
+		segment_sizes = [(starts[k + 1] if k + 1 < len(starts) else sorted_pids.size) - starts[k] 
+		                for k in range(len(uniq))]
+		avg_segment_size = sum(segment_sizes) / len(segment_sizes) if segment_sizes else 0
+		small_segments = sum(1 for s in segment_sizes if s < 3)
+		
+		# If average segment size is very small (< 5) and we have many segments,
+		# conditional encoding overhead might not be worth it
+		# However, for now we'll still use it but optimize small segments
+		
 		for k, pid in enumerate(uniq.tolist()):
 			start = starts[k]
 			end = starts[k + 1] if k + 1 < len(starts) else sorted_pids.size
 			segment = sorted_vals[start:end]
-			prefer_delta = dicts[j] is None
-			use_ace = False if prefer_delta else _should_use_ace(segment)
-			fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
-			parts.append(int(pid).to_bytes(8, "little", signed=True))
-			parts.append(len(fb).to_bytes(8, "little", signed=False))
+			
+			# Choose compression method based on segment size
+			# For better compression, try all methods for larger segments
+			# Be more aggressive - try all methods for more segments
+			if segment.size > 8:  # Lowered threshold: try all methods for segments > 8
+				# For larger segments, try all compression methods (worth the cost for better compression)
+				fb = _try_all_compression_methods(segment, dicts[j])
+			elif segment.size > 3:
+				# For medium segments (4-10), try ACE and delta/generic, pick best
+				candidates = []
+				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
+				
+				# Try ACE if applicable
+				if dicts[j] is not None and not isinstance(dicts[j], tuple):
+					unique_count = int(np.unique(segment).size)
+					if unique_count <= 16384:  # Increased threshold to match _try_all_compression_methods
+						try:
+							ace_result = compress_numeric_array_fast(segment, use_ace=True, prefer_delta=False)
+							candidates.append(ace_result)
+						except Exception:
+							pass
+				
+				# Try delta if numeric or medium/high cardinality
+				if prefer_delta_base or (dicts[j] is not None and not isinstance(dicts[j], tuple) and int(np.unique(segment).size) > 30):  # Lower threshold
+					try:
+						delta_result = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=True)
+						candidates.append(delta_result)
+					except Exception:
+						pass
+				
+				# Always try generic
+				try:
+					generic_result = compress_numeric_array_fast(segment, use_ace=False, prefer_delta=False)
+					candidates.append(generic_result)
+				except Exception:
+					pass
+				
+				if candidates:
+					candidates.sort(key=len)
+					fb = candidates[0]
+				else:
+					# Fallback
+					use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
+					fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
+			else:
+				# For very small segments (<=3), use heuristic (fast)
+				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
+				use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
+				fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
+			
+			# Use variable-length encoding for parent ID and length to save space
+			# For small parent IDs and lengths, use fewer bytes
+			pid_bytes = _encode_varint(pid, signed=False)  # Parent IDs are non-negative
+			parts.append(pid_bytes)
+			# Use varint for length (unsigned since length is always positive)
+			# Note: We use a flag byte to indicate raw storage instead of negative length
+			length_bytes = _encode_varint(len(fb), signed=False)
+			parts.append(length_bytes)
 			parts.append(fb)
+			
 		frames[j] = b"".join(parts)
 
 	with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -143,12 +417,51 @@ def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows:
 			ptr = 4
 			nb = int.from_bytes(frame[ptr:ptr+4], "little"); ptr += 4
 			bucket_data: Dict[int, List[int]] = {}
-			for _ in range(nb):
-				pid = int.from_bytes(frame[ptr:ptr+8], "little", signed=True); ptr += 8
-				flen = int.from_bytes(frame[ptr:ptr+8], "little", signed=False); ptr += 8
-				fb = frame[ptr:ptr+flen]; ptr += flen
-				vals = decompress_numeric_array(fb).tolist()
-				bucket_data[pid] = vals
+			
+			# Always try new format (varint) first - this is the current encoding format
+			# Only fall back to old format if varint decoding fails AND we have enough bytes for old format
+			save_ptr = ptr
+			try:
+				# Try to decode all buckets as varints (new format)
+				for _ in range(nb):
+					pid, bytes_consumed = _decode_varint(frame, ptr, signed=False)
+					ptr += bytes_consumed
+					flen, bytes_consumed = _decode_varint(frame, ptr, signed=False)
+					ptr += bytes_consumed
+					if ptr + flen > len(frame):
+						raise IndexError("Not enough data for segment")
+					fb = frame[ptr:ptr+flen]
+					ptr += flen
+					vals = decompress_numeric_array(fb).tolist()
+					bucket_data[pid] = vals
+			except (ValueError, IndexError) as e:
+				# Varint decoding failed - try old format only if we have enough bytes
+				# Old format: 8 bytes per pid + 8 bytes per length
+				expected_old_format_size = nb * 16
+				remaining_bytes = len(frame) - save_ptr
+				
+				if remaining_bytes >= expected_old_format_size:
+					# Might be old format - try decoding as old format
+					ptr = save_ptr
+					bucket_data = {}
+					try:
+						for _ in range(nb):
+							pid = int.from_bytes(frame[ptr:ptr+8], "little", signed=True)
+							ptr += 8
+							flen = int.from_bytes(frame[ptr:ptr+8], "little", signed=False)
+							ptr += 8
+							if ptr + flen > len(frame):
+								raise IndexError("Not enough data for segment in old format")
+							fb = frame[ptr:ptr+flen]
+							ptr += flen
+							vals = decompress_numeric_array(fb).tolist()
+							bucket_data[pid] = vals
+					except (ValueError, IndexError):
+						# Both formats failed - re-raise original error
+						raise e
+				else:
+					# Not enough bytes for old format - re-raise original error
+					raise e
 			
 			# Reconstruct in sorted order, then unsort
 			# Values in buckets are in sorted-by-parent-ID order
