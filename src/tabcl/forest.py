@@ -39,27 +39,50 @@ def build_mdl_weighted_forest(
 	
 	# Quick cardinality check - skip high-cardinality columns early
 	# Use approximation: if even a small sample has high uniqueness, skip the column
+	# NOTE: For numeric/float columns, high cardinality is expected (continuous data),
+	# so we should NOT skip them. Only skip high-cardinality categorical/string columns.
 	for i in range(n_cols):
 		col_data = table_sample[:, i]
+		# Check if column is numeric - if so, don't skip based on cardinality
+		is_numeric = False
 		try:
-			col_unique = len(np.unique(col_data))
-		except (TypeError, ValueError):
-			# For mixed types, use small sample for speed
-			sample_size = min(100, len(col_data))
-			if sample_size < len(col_data):
-				sample_idx = rng.choice(len(col_data), size=sample_size, replace=False)
-				col_unique_approx = len(set(col_data[sample_idx].tolist()))
-				# Estimate: if sample has high uniqueness, column is high-cardinality
-				col_unique = col_unique_approx * (len(col_data) / sample_size) if col_unique_approx > sample_size * 0.5 else col_unique_approx
-			else:
-				if col_data.dtype == object:
-					col_unique = len(set(col_data.tolist()))
+			if isinstance(col_data, np.ndarray):
+				if col_data.dtype.kind in ['f', 'i', 'u']:  # float, int, unsigned int
+					is_numeric = True
+				elif col_data.dtype == object:
+					# For object arrays, check if values are numeric
+					# Sample a few values to check
+					sample_vals = col_data[:min(10, len(col_data))]
+					try:
+						# Try to convert to float - if it works, it's numeric
+						_ = [float(v) for v in sample_vals if v is not None]
+						is_numeric = True
+					except (ValueError, TypeError):
+						is_numeric = False
+		except:
+			pass
+		
+		# Only check cardinality for non-numeric columns
+		if not is_numeric:
+			try:
+				col_unique = len(np.unique(col_data))
+			except (TypeError, ValueError):
+				# For mixed types, use small sample for speed
+				sample_size = min(100, len(col_data))
+				if sample_size < len(col_data):
+					sample_idx = rng.choice(len(col_data), size=sample_size, replace=False)
+					col_unique_approx = len(set(col_data[sample_idx].tolist()))
+					# Estimate: if sample has high uniqueness, column is high-cardinality
+					col_unique = col_unique_approx * (len(col_data) / sample_size) if col_unique_approx > sample_size * 0.5 else col_unique_approx
 				else:
-					col_unique = len(set(col_data.flatten().tolist()))
-		# Skip if >50% unique in sample (columns are likely identifiers)
-		threshold = int(0.5 * card_check_sample)
-		if col_unique > threshold:
-			skip_high_card.add(i)
+					if col_data.dtype == object:
+						col_unique = len(set(col_data.tolist()))
+					else:
+						col_unique = len(set(col_data.flatten().tolist()))
+			# Skip if >50% unique in sample (columns are likely identifiers)
+			threshold = int(0.5 * card_check_sample)
+			if col_unique > threshold:
+				skip_high_card.add(i)
 	
 	# Prepare edge pairs to compute
 	edge_pairs = []
@@ -124,6 +147,13 @@ def build_mdl_weighted_forest(
 			_, _, w = compute_edge_weight(i, j)
 			G.add_edge(i, j, weight=w)
 
+	# Debug: print all edge weights before MST
+	# (commented out for production, but useful for debugging)
+	# if len(G.edges()) > 0:
+	#     print(f"DEBUG: Graph has {len(G.edges())} edges with weights:")
+	#     for u, v, d in G.edges(data=True):
+	#         print(f"  Edge ({u}, {v}): weight={d.get('weight', 0.0)}")
+	
 	mst = nx.maximum_spanning_tree(G)
 	edges = [(u, v, float(d.get("weight", 0.0))) for u, v, d in mst.edges(data=True)]
 	# Only filter out edges with negative weights - they hurt compression (MDL cost > benefit)

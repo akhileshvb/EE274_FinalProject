@@ -195,16 +195,75 @@ def mdl_cost_fn_openzl(x: np.ndarray, y: np.ndarray, row_sample: Optional[int] =
 	"""
 	Compute MDL cost for pairwise distribution using OpenZL compression.
 	Slower but more accurate. Use for final compression, not for forest building.
+	
+	For continuous numeric data, we discretize/bucket the values to avoid creating
+	huge histograms with many unique pairs. This makes MDL cost more reasonable.
 	"""
+	rng = np.random.default_rng(seed)  # Always create RNG for potential use in discretization
 	if row_sample is not None and row_sample < len(x):
-		rng = np.random.default_rng(seed)
 		idx = rng.choice(len(x), size=row_sample, replace=False)
 		x_sampled = x[idx]
 		y_sampled = y[idx]
 	else:
 		x_sampled = x
 		y_sampled = y
-	counts = histogram_from_pairs(x_sampled, y_sampled)
+	
+	# For continuous numeric data, discretize before building histogram
+	# This prevents huge histograms with many unique float pairs
+	# Use quantile-based bucketing which preserves correlation structure better than hash-based
+	# Hash-based bucketing destroys correlation because it randomizes values
+	if isinstance(x_sampled, np.ndarray) and isinstance(y_sampled, np.ndarray):
+		if x_sampled.dtype.kind == 'f' or y_sampled.dtype.kind == 'f':  # Float type
+			# Use quantile-based bucketing to preserve correlation structure
+			# This is better for numeric data than hash-based bucketing
+			# Use fewer buckets to reduce MDL cost - 256 is enough to preserve correlation for most cases
+			num_buckets = 256  # Reduced to 256 to significantly reduce MDL cost while still preserving correlation
+			
+			# Discretize x using quantile-based bucketing
+			if x_sampled.dtype.kind == 'f':
+				# For large arrays, sample to compute quantiles efficiently
+				if len(x_sampled) > 10000:
+					sample_idx = rng.choice(len(x_sampled), size=min(10000, len(x_sampled)), replace=False)
+					x_sample_for_quantiles = x_sampled[sample_idx]
+				else:
+					x_sample_for_quantiles = x_sampled
+				# Compute quantiles and use them as bucket boundaries
+				quantiles = np.linspace(0, 100, num_buckets + 1)
+				x_percentiles = np.percentile(x_sample_for_quantiles, quantiles)
+				# Handle edge case where all values are the same
+				if np.all(x_percentiles == x_percentiles[0]):
+					x_discrete = np.zeros_like(x_sampled, dtype=np.int64)
+				else:
+					x_discrete = np.digitize(x_sampled, x_percentiles[1:-1], right=False)
+					x_discrete = np.clip(x_discrete, 0, num_buckets - 1)
+			else:
+				x_discrete = x_sampled
+			
+			# Discretize y using quantile-based bucketing
+			if y_sampled.dtype.kind == 'f':
+				if len(y_sampled) > 10000:
+					sample_idx = rng.choice(len(y_sampled), size=min(10000, len(y_sampled)), replace=False)
+					y_sample_for_quantiles = y_sampled[sample_idx]
+				else:
+					y_sample_for_quantiles = y_sampled
+				quantiles = np.linspace(0, 100, num_buckets + 1)
+				y_percentiles = np.percentile(y_sample_for_quantiles, quantiles)
+				if np.all(y_percentiles == y_percentiles[0]):
+					y_discrete = np.zeros_like(y_sampled, dtype=np.int64)
+				else:
+					y_discrete = np.digitize(y_sampled, y_percentiles[1:-1], right=False)
+					y_discrete = np.clip(y_discrete, 0, num_buckets - 1)
+			else:
+				y_discrete = y_sampled
+			
+			counts = histogram_from_pairs(x_discrete, y_discrete)
+		else:
+			# Integer or other types - use as-is
+			counts = histogram_from_pairs(x_sampled, y_sampled)
+	else:
+		# Non-numpy arrays - use as-is
+		counts = histogram_from_pairs(x_sampled, y_sampled)
+	
 	return openzl_model_bits(counts)
 
 

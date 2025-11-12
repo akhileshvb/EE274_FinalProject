@@ -54,33 +54,71 @@ def compute_hashed_mi(
 	seed: int = 0,
 ) -> float:
 	"""
-	Approximate I(X;Y) in nats using hashing and optional row sampling.
-	- Values are hashed into num_buckets; we compute MI on the hashed contingency.
+	Approximate I(X;Y) in nats using bucketing and optional row sampling.
+	- For numeric data, uses quantile-based bucketing to preserve correlation structure
+	- For non-numeric data, uses hash-based bucketing
 	- If row_sample is provided and smaller than len(x), we sample rows without replacement.
 	"""
 	if x.shape[0] != y.shape[0]:
 		raise ValueError("x and y must have same length")
 	n_total = x.shape[0]
 	idx = np.arange(n_total)
+	rng = np.random.default_rng(seed)
 	if row_sample is not None and row_sample < n_total:
-		rng = np.random.default_rng(seed)
 		idx = rng.choice(idx, size=row_sample, replace=False)
 	xv = x[idx]
 	yv = y[idx]
 
-	# Hash to buckets - optimize for speed with vectorized operations
-	# Convert to string array once, then hash
-	if len(xv) > 1000:
-		# For large arrays, use list comprehension (faster for large datasets)
-		hx = np.array([hash(str(v)) % num_buckets for v in xv], dtype=np.int64)
-		hy = np.array([hash(str(v)) % num_buckets for v in yv], dtype=np.int64)
+	# For numeric (float) data, use quantile-based bucketing to preserve correlation
+	# Hash-based bucketing destroys correlation structure for numeric data
+	# Use fewer buckets for numeric data to reduce MDL cost while preserving correlation
+	numeric_num_buckets = min(num_buckets, 256)  # Cap at 256 for numeric to reduce MDL cost significantly
+	if isinstance(xv, np.ndarray) and xv.dtype.kind == 'f':
+		# Quantile-based bucketing for x
+		if len(xv) > 10000:
+			sample_idx = rng.choice(len(xv), size=min(10000, len(xv)), replace=False)
+			x_sample_for_quantiles = xv[sample_idx]
+		else:
+			x_sample_for_quantiles = xv
+		quantiles = np.linspace(0, 100, numeric_num_buckets + 1)
+		x_percentiles = np.percentile(x_sample_for_quantiles, quantiles)
+		if np.all(x_percentiles == x_percentiles[0]):
+			hx = np.zeros_like(xv, dtype=np.int64)
+		else:
+			hx = np.digitize(xv, x_percentiles[1:-1], right=False)
+			hx = np.clip(hx, 0, numeric_num_buckets - 1).astype(np.int64)
 	else:
-		# For smaller arrays, vectorized approach
-		hx = np.mod(np.array([hash(str(v)) for v in xv], dtype=np.int64), num_buckets)
-		hy = np.mod(np.array([hash(str(v)) for v in yv], dtype=np.int64), num_buckets)
+		# Hash-based bucketing for non-numeric data
+		if len(xv) > 1000:
+			hx = np.array([hash(str(v)) % num_buckets for v in xv], dtype=np.int64)
+		else:
+			hx = np.mod(np.array([hash(str(v)) for v in xv], dtype=np.int64), num_buckets)
+	
+	if isinstance(yv, np.ndarray) and yv.dtype.kind == 'f':
+		# Quantile-based bucketing for y
+		if len(yv) > 10000:
+			sample_idx = rng.choice(len(yv), size=min(10000, len(yv)), replace=False)
+			y_sample_for_quantiles = yv[sample_idx]
+		else:
+			y_sample_for_quantiles = yv
+		quantiles = np.linspace(0, 100, numeric_num_buckets + 1)
+		y_percentiles = np.percentile(y_sample_for_quantiles, quantiles)
+		if np.all(y_percentiles == y_percentiles[0]):
+			hy = np.zeros_like(yv, dtype=np.int64)
+		else:
+			hy = np.digitize(yv, y_percentiles[1:-1], right=False)
+			hy = np.clip(hy, 0, numeric_num_buckets - 1).astype(np.int64)
+	else:
+		# Hash-based bucketing for non-numeric data
+		if len(yv) > 1000:
+			hy = np.array([hash(str(v)) % num_buckets for v in yv], dtype=np.int64)
+		else:
+			hy = np.mod(np.array([hash(str(v)) for v in yv], dtype=np.int64), num_buckets)
 
 	# Build contingency table using advanced indexing (fast)
-	C = np.zeros((num_buckets, num_buckets), dtype=np.int64)
+	# Use the appropriate bucket size (numeric_num_buckets for numeric, num_buckets for hash-based)
+	actual_buckets = numeric_num_buckets if (isinstance(xv, np.ndarray) and xv.dtype.kind == 'f') or (isinstance(yv, np.ndarray) and yv.dtype.kind == 'f') else num_buckets
+	C = np.zeros((actual_buckets, actual_buckets), dtype=np.int64)
 	np.add.at(C, (hx, hy), 1)
 	n = float(C.sum())
 	if n == 0:
