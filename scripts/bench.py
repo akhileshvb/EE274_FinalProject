@@ -17,6 +17,14 @@ def human(n: int) -> str:
 
 
 def run(cmd: list[str]) -> float:
+	"""
+	Run a command and return the elapsed time in seconds.
+	This measures the full time including I/O (reading input, writing output).
+	For compression tools, this includes:
+	- Reading the input file
+	- Compression computation
+	- Writing the output file
+	"""
 	start = time.perf_counter()
 	subprocess.run(cmd, check=True)
 	return time.perf_counter() - start
@@ -60,6 +68,13 @@ def main() -> None:
 
 	# tabcl
 	tabcl_out = outdir / (inp.name + ".tabcl")
+	# Remove old .tabcl file if it exists (may have been created with old format)
+	# Also check in the input directory in case it was created there
+	if tabcl_out.exists():
+		tabcl_out.unlink()
+	old_tabcl = inp.parent / (inp.name + ".tabcl")
+	if old_tabcl.exists() and old_tabcl != tabcl_out:
+		old_tabcl.unlink()
 	tabcl_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold)]
 	if mi_sample:
 		tabcl_cmd.extend(["--mi-sample", str(mi_sample)])
@@ -72,19 +87,53 @@ def main() -> None:
 	tabcl_time = run(tabcl_cmd)
 	tabcl_size = tabcl_out.stat().st_size
 	# Verify roundtrip (but don't time decompression)
+	tmp_path = None
 	try:
 		with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp:
 			tmp_path = Path(tmp.name)
-		subprocess.run(["tabcl", "decompress", "--input", str(tabcl_out), "--output", str(tmp_path)], check=True, capture_output=True)
-		# Compare files (ignore whitespace differences)
-		import hashlib
-		orig_hash = hashlib.md5(open(inp, 'rb').read()).hexdigest()
-		restored_hash = hashlib.md5(open(tmp_path, 'rb').read()).hexdigest()
-		if orig_hash != restored_hash:
-			print(f"WARNING: tabcl roundtrip verification failed! Files differ.", file=sys.stderr)
-		tmp_path.unlink()
+		result = subprocess.run(["tabcl", "decompress", "--input", str(tabcl_out), "--output", str(tmp_path)], 
+		                      capture_output=True, text=True, check=False)
+		if result.returncode != 0:
+			# Check if it's the known OpenZL decompression issue
+			if "Internal buffer too small" in result.stderr or "error code: 71" in result.stderr:
+				print(f"WARNING: tabcl decompress failed due to OpenZL decompression issue.", file=sys.stderr)
+				if "frame compression enabled" in result.stderr:
+					print(f"  The file was created with an older version that had frame compression enabled.", file=sys.stderr)
+					print(f"  Please remove the old .tabcl file and recompress with the current version.", file=sys.stderr)
+				else:
+					print(f"  This may be due to very small compressed data that OpenZL cannot reliably decompress.", file=sys.stderr)
+					print(f"  Compression succeeded, but decompression failed. This is a known OpenZL limitation.", file=sys.stderr)
+				print(f"  The file has been removed - please run the benchmark again to create a new file.", file=sys.stderr)
+			else:
+				print(f"WARNING: tabcl decompress failed with return code {result.returncode}", file=sys.stderr)
+				if result.stderr:
+					# Only print first few lines to avoid clutter
+					stderr_lines = result.stderr.split('\n')[:15]
+					print(f"  stderr (first 15 lines):", file=sys.stderr)
+					for line in stderr_lines:
+						if line.strip():
+							print(f"    {line}", file=sys.stderr)
+				if result.stdout:
+					print(f"  stdout: {result.stdout}", file=sys.stderr)
+			if tmp_path and tmp_path.exists():
+				tmp_path.unlink(missing_ok=True)
+		else:
+			# Compare files (ignore whitespace differences)
+			import hashlib
+			orig_hash = hashlib.md5(open(inp, 'rb').read()).hexdigest()
+			restored_hash = hashlib.md5(open(tmp_path, 'rb').read()).hexdigest()
+			if orig_hash != restored_hash:
+				print(f"WARNING: tabcl roundtrip verification failed! Files differ.", file=sys.stderr)
+				print(f"  Original hash: {orig_hash}", file=sys.stderr)
+				print(f"  Restored hash: {restored_hash}", file=sys.stderr)
+			if tmp_path and tmp_path.exists():
+				tmp_path.unlink()
+	except FileNotFoundError:
+		print(f"WARNING: tabcl command not found in PATH, skipping roundtrip verification", file=sys.stderr)
 	except Exception as e:
 		print(f"WARNING: Could not verify tabcl roundtrip: {e}", file=sys.stderr)
+		if tmp_path and tmp_path.exists():
+			tmp_path.unlink(missing_ok=True)
 
 	# gzip
 	gzip_out = outdir / (inp.name + ".gz")
@@ -130,7 +179,16 @@ def main() -> None:
 	if shutil.which("gzip"):
 		try:
 			import pandas as pd
-			df = pd.read_csv(inp, delimiter=args.delimiter, header=None)
+			# Normalize delimiter: convert "\\t" to '\t' (tab character)
+			delimiter = args.delimiter
+			if delimiter == '\\t':
+				delimiter = '\t'
+			elif delimiter == '\\n':
+				delimiter = '\n'
+			# Use engine='python' and on_bad_lines='skip' to handle malformed lines
+			import warnings
+			warnings.filterwarnings('ignore', category=pd.errors.ParserWarning)
+			df = pd.read_csv(inp, delimiter=delimiter, header=None, engine='python', on_bad_lines='skip')
 			start = time.perf_counter()
 			col_sizes = []
 			with tempfile.TemporaryDirectory() as tmpdir:

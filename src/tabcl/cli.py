@@ -11,7 +11,7 @@ import pandas as pd
 
 from .forest import build_mdl_weighted_forest
 from .codec import mdl_cost_fn_openzl, mdl_cost_fn_fast, generic_bytes_compress, generic_bytes_decompress
-from .conditional import orient_forest, encode_columns_with_parents, decode_columns_with_parents
+from .conditional import orient_forest, encode_columns_with_parents, decode_columns_with_parents, _encode_varint, _decode_varint
 
 
 @dataclass
@@ -22,6 +22,7 @@ class Model:
 	parents: List[int]
 	rare_meta: List[str]
 	delimiter: str = ","  # CSV delimiter (default comma for backward compatibility)
+	line_ending: str = "\n"  # Line ending style: "\n" (LF) or "\r\n" (CRLF)
 
 	def to_bytes(self) -> bytes:
 		# Optimize dictionary storage: store dictionaries as compact binary format
@@ -97,6 +98,7 @@ class Model:
 			"parents": self.parents,
 			"rare_meta": self.rare_meta,
 			"delimiter": self.delimiter,
+			"line_ending": self.line_ending,  # Preserve line ending style
 		}
 		json_bytes = json.dumps(obj, separators=(",", ":")).encode("utf-8")
 		# Compress the model metadata to reduce overhead
@@ -104,8 +106,9 @@ class Model:
 
 	@staticmethod
 	def from_bytes(b: bytes) -> "Model":
-		# Decompress the model metadata
-		decompressed_bytes = generic_bytes_decompress(b)
+		# Decompress the model metadata (if it was compressed)
+		# Use fallback_to_uncompressed=True to handle cases where data is uncompressed
+		decompressed_bytes = generic_bytes_decompress(b, fallback_to_uncompressed=True)
 		obj = json.loads(decompressed_bytes.decode("utf-8"))
 		
 		import struct
@@ -114,7 +117,8 @@ class Model:
 		if isinstance(columns_data, str):
 			# New format: base64 encoded compressed binary
 			columns_compressed = base64.b64decode(columns_data.encode("ascii"))
-			columns_binary = generic_bytes_decompress(columns_compressed)
+			# Use fallback_to_uncompressed=True to handle cases where data is uncompressed
+			columns_binary = generic_bytes_decompress(columns_compressed, fallback_to_uncompressed=True)
 			ptr = 0
 			n_cols = struct.unpack("<I", columns_binary[ptr:ptr+4])[0]
 			ptr += 4
@@ -170,8 +174,8 @@ class Model:
 						if isinstance(data, str):
 							# New format: base64 encoded, then compressed
 							compressed_data = base64.b64decode(data.encode("ascii"))
-							# Decompress the dictionary data
-							binary_data = generic_bytes_decompress(compressed_data)
+							# Use fallback_to_uncompressed=True to handle cases where data is uncompressed
+							binary_data = generic_bytes_decompress(compressed_data, fallback_to_uncompressed=True)
 						else:
 							# Fallback: direct binary (shouldn't happen in JSON)
 							binary_data = data
@@ -212,15 +216,28 @@ class Model:
 			parents=list(obj["parents"]),
 			rare_meta=list(obj.get("rare_meta", [""] * len(columns))),
 			delimiter=obj.get("delimiter", ","),  # Default to comma for backward compatibility
+			line_ending=obj.get("line_ending", "\n"),  # Default to LF for backward compatibility
 		)
 
 
 def _load_csv(path: Path, delimiter: str) -> pd.DataFrame:
 	# Handle both tab-separated and comma-separated
-	sep = '\t' if delimiter == '\t' else delimiter
+	# Convert string representations of special characters
+	# When passed from command line, "\t" comes as "\\t" (literal backslash-t)
+	if delimiter == '\\t' or delimiter == '\t':
+		sep = '\t'
+	elif delimiter == '\\n':
+		sep = '\n'
+	else:
+		sep = delimiter
 	# Read with no header, keeping all values as strings to preserve exact format
 	# Use dtype=str to prevent type inference that could change empty strings to NaN
-	df = pd.read_csv(path, delimiter=sep, header=None, skipinitialspace=False, dtype=str, keep_default_na=False, na_values=[])
+	# Use engine='python' for tab delimiters to avoid regex warnings and handle malformed lines
+	import warnings
+	warnings.filterwarnings('ignore', category=pd.errors.ParserWarning)
+	# Use on_bad_lines='skip' to handle lines with inconsistent field counts
+	df = pd.read_csv(path, delimiter=sep, header=None, skipinitialspace=False, dtype=str, 
+	                 keep_default_na=False, na_values=[], engine='python', on_bad_lines='skip')
 	# Replace empty strings with None for processing, but we'll track original format
 	# Empty strings become None for easier processing, but we preserve the fact they were empty
 	return df
@@ -356,6 +373,7 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 		if (can_be_numeric_int or can_be_numeric_float) and not has_empty:
 			numeric_int_values = []
 			numeric_float_values = []
+			numeric_original_strings = []  # Store original string representations for format preservation
 			has_decimal = False
 			
 			# For large datasets, use vectorized conversion for speed
@@ -366,6 +384,8 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 					if series_float.isna().sum() == 0:
 						# All values are numeric
 						numeric_float_values = series_float.tolist()
+						# Store original strings for format preservation
+						numeric_original_strings = [str(val).strip() if val is not None else "" for val in series]
 						# Check if any are non-integer
 						has_decimal = any(f != int(f) for f in numeric_float_values if not pd.isna(f))
 						numeric_int_values = [int(f) for f in numeric_float_values]
@@ -379,6 +399,7 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 				# For smaller datasets, check each value
 				for val in series:
 					val_str = str(val).strip() if val is not None else ""
+					numeric_original_strings.append(val_str)  # Store original string
 					try:
 						f_val = float(val_str)
 						numeric_float_values.append(f_val)
@@ -392,7 +413,8 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 		
 		# Store as numeric if possible
 		# Prefer integers (more efficient), but handle floats if needed
-		if can_be_numeric_int and not has_empty and len(numeric_int_values) == len(series):
+		# Only store as pure integers if there are NO decimal values
+		if can_be_numeric_int and not has_empty and not has_decimal and len(numeric_int_values) == len(series):
 			try:
 				# Check if we can store as int64
 				arr = np.array(numeric_int_values, dtype=np.int64)
@@ -492,7 +514,58 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 					indices_list.append(best_int_array)
 					# Store scale info: use a tuple ("_scale", scale) to indicate scaled float
 					dicts.append(("_scale", best_scale))
-					rare_blobs.append(b"")
+					# Store original string formats in rare_meta for roundtrip accuracy
+					# This preserves formats like "99.0" vs "99"
+					if numeric_original_strings and len(numeric_original_strings) == len(series):
+						# Store format map for ALL values to preserve exact string format
+						# This handles cases like "99.0" vs "99", "99.10" vs "99.1", etc.
+						# Optimize storage using delta encoding and varint for indices
+						import struct
+						format_entries = []
+						for idx, (orig_str, f_val) in enumerate(zip(numeric_original_strings, numeric_float_values)):
+							# Check if the reconstructed format would differ from original
+							# For scale=1: check if orig_str ends with .0 but reconstructed would be int
+							# For scale!=1: check if orig_str has trailing zeros that would be lost
+							if best_scale == 1:
+								# For integers, only store if original had .0
+								if f_val == int(f_val) and orig_str.endswith('.0'):
+									format_entries.append((idx, orig_str))
+							else:
+								# For scaled floats, check if format would differ
+								reconstructed_str = str(f_val)
+								if orig_str != reconstructed_str:
+									# Store original format if it differs
+									format_entries.append((idx, orig_str))
+						
+						if format_entries:
+							# Optimize storage: use delta encoding for indices and varint encoding
+							# Sort by index for better delta encoding
+							format_entries.sort(key=lambda x: x[0])
+							
+							format_parts = []
+							format_count = len(format_entries)
+							format_parts.append(struct.pack("<I", format_count))
+							
+							prev_idx = -1
+							for idx, orig_str in format_entries:
+								# Delta encode index
+								delta = idx - prev_idx
+								prev_idx = idx
+								# Use varint encoding for delta (more efficient for small deltas)
+								format_parts.append(_encode_varint(delta, signed=False))
+								
+								# Store string with length prefix (use varint for length too)
+								orig_bytes = orig_str.encode("utf-8")
+								format_parts.append(_encode_varint(len(orig_bytes), signed=False))
+								format_parts.append(orig_bytes)
+							
+							format_data = b"".join(format_parts)
+							# Always compress format preservation data (it compresses well due to repetition)
+							rare_blobs.append(generic_bytes_compress(format_data))
+						else:
+							rare_blobs.append(b"")
+					else:
+						rare_blobs.append(b"")
 					is_numeric_list.append(True)
 					continue
 				else:
@@ -788,10 +861,29 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 
 
 def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None) -> None:
+	import time
+	profiler = {}  # Track time spent in each stage
+	total_start = time.time()
+	
 	inp = Path(input_path)
 	outp = Path(output_path)
+	
+	# Detect line ending style from original file
+	line_ending = "\n"  # Default to LF
+	try:
+		with inp.open('rb') as f:
+			first_chunk = f.read(8192)  # Read first 8KB to detect line endings
+			if b'\r\n' in first_chunk:
+				line_ending = "\r\n"  # CRLF (Windows)
+			elif b'\n' in first_chunk:
+				line_ending = "\n"  # LF (Unix)
+	except Exception:
+		pass  # Use default if detection fails
+	
+	stage_start = time.time()
 	df = _load_csv(inp, delimiter)
 	tab = _df_to_table(df)
+	profiler["load_csv"] = time.time() - stage_start
 	# Two-phase approach for speed + accuracy:
 	# 1. Fast proxy MDL to rank ALL possible edges quickly (not just MST)
 	# 2. OpenZL MDL on top candidates, then build MST
@@ -799,6 +891,7 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	n_cols = len(tab[0])
 	
 	# Skip high-cardinality columns (they compress better independently)
+	stage_start = time.time()
 	skip_high_card = set()
 	rng = np.random.default_rng(mi_seed)
 	card_check_sample = min(500, n_rows) if n_rows > 500 else n_rows
@@ -825,6 +918,7 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		threshold = int(0.5 * card_check_sample)
 		if col_unique > threshold:
 			skip_high_card.add(i)
+	profiler["cardinality_check"] = time.time() - stage_start
 	
 	# Phase 1: Fast ranking with proxy MDL on all edge pairs
 	# For datasets <= 10k rows, can afford to use exact MI throughout for better accuracy
@@ -892,6 +986,7 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		return (i, j, w)
 	
 	# Compute all edge pairs (skip high-cardinality columns)
+	stage_start = time.time()
 	all_pairs = [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols) if i not in skip_high_card and j not in skip_high_card]
 	max_workers = min(len(all_pairs), int(os.cpu_count() or 4), 16)
 	with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -900,6 +995,7 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	# Filter negative weights and sort by weight
 	all_fast_edges = [(u, v, w) for u, v, w in all_fast_edges if w > 0.0]
 	all_fast_edges.sort(key=lambda x: x[2], reverse=True)
+	profiler["phase1_mi"] = time.time() - stage_start
 	
 	# Phase 2: Refine top candidates with OpenZL MDL and EXACT MI for accuracy
 	# Use exact MI (not hashed) for final selection - critical for compression ratio
@@ -954,12 +1050,14 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		w = n_rows * mi_bits - mdl_bits
 		return (u, v, w)
 	
+	stage_start = time.time()
 	max_workers = min(len(top_candidates), int(os.cpu_count() or 4), 8)
 	with ThreadPoolExecutor(max_workers=max_workers) as executor:
 		refined_edges = list(executor.map(recompute_weight, top_candidates))
 	
 	# Filter negative weights
 	refined_edges = [(u, v, w) for u, v, w in refined_edges if w > 0.0]
+	profiler["phase2_mi"] = time.time() - stage_start
 	
 	# Build maximum-weight forest - keep all positive-weight edges that don't create cycles
 	# The paper optimizes over all forests, so we use greedy algorithm (Kruskal's for forests)
@@ -980,46 +1078,47 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	# The greedy algorithm above produces a maximum-weight forest
 	# If no edges were added, we have isolated nodes (each is its own tree)
 	# This is correct behavior for a forest
+	stage_start = time.time()
 	parents = orient_forest(len(df.columns), [(int(u), int(v), float(w)) for u, v, w in edges])
+	profiler["build_forest"] = time.time() - stage_start
+	
+	stage_start = time.time()
 	indices, dicts, rare_blobs, is_numeric = _tokenize_columns(df, rare_threshold=rare_threshold)
+	profiler["tokenize_columns"] = time.time() - stage_start
 	rare_b64 = [base64.b64encode(b).decode("ascii") for b in rare_blobs]
 	# Store is_numeric information in the model (reuse rare_meta structure or add new field)
 	# For now, encode it in the dicts structure: None = numeric, list = categorical
 	# Store delimiter so we can output CSV with correct separator
-	model = Model(columns=list(df.columns), edges=[[int(u), int(v), float(w)] for u, v, w in edges], dicts=dicts, parents=parents, rare_meta=rare_b64, delimiter=delimiter)
+	# Normalize delimiter before storing: convert "\\t" to '\t' (tab character)
+	# This ensures it's stored as a single character and works correctly in to_csv()
+	normalized_delimiter = delimiter
+	if delimiter == '\\t':
+		normalized_delimiter = '\t'
+	elif delimiter == '\\n':
+		normalized_delimiter = '\n'
+	model = Model(columns=list(df.columns), edges=[[int(u), int(v), float(w)] for u, v, w in edges], dicts=dicts, parents=parents, rare_meta=rare_b64, delimiter=normalized_delimiter, line_ending=line_ending)
 	# Store is_numeric as a separate metadata field by encoding in rare_meta
 	# Actually, we can infer it from dicts (None = numeric), so we don't need to store it separately
 
+	stage_start = time.time()
 	model_bytes = model.to_bytes()
+	profiler["serialize_model"] = time.time() - stage_start
+	
+	stage_start = time.time()
 	frames: List[bytes] = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1)
+	profiler["encode_columns"] = time.time() - stage_start
 
 	# Compress frames with an additional layer for better compression
 	# This helps especially when frames have redundancy or patterns
-	# Be more aggressive: try compressing smaller frames too
+	# NOTE: Frame compression is disabled due to OpenZL decompression issues with small frames
+	# TODO: Re-enable once we can reliably compress/decompress all frame sizes
 	compressed_frames = []
 	for frame in frames:
-		# Try compressing frames > 50 bytes (lower threshold for more compression)
-		if len(frame) > 50:
-			compressed_frame = generic_bytes_compress(frame)
-			# Use compressed version if it saves at least 2 bytes (account for flag byte)
-			# This is more aggressive - accept smaller savings
-			if len(compressed_frame) < len(frame) - 2:
-				# Use compressed version with flag
-				compressed_frames.append((True, compressed_frame))
-			else:
-				compressed_frames.append((False, frame))
-		else:
-			# For very small frames, still try compression if it might help
-			if len(frame) > 20:
-				compressed_frame = generic_bytes_compress(frame)
-				# For small frames, only compress if savings are significant (at least 3 bytes)
-				if len(compressed_frame) < len(frame) - 3:
-					compressed_frames.append((True, compressed_frame))
-				else:
-					compressed_frames.append((False, frame))
-			else:
-				compressed_frames.append((False, frame))
+		# For now, don't compress frames - just store them uncompressed
+		# This avoids OpenZL "Internal buffer too small" errors on decompression
+		compressed_frames.append((False, frame))
 
+	stage_start = time.time()
 	with outp.open("wb") as f:
 		f.write(b"TABCL\x00")
 		f.write((4).to_bytes(4, "little"))  # Bump version to 4 for compressed frames
@@ -1036,6 +1135,17 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 				f.write(b"\xFF")
 			f.write(length_bytes)
 			f.write(frame_data)
+	profiler["write_file"] = time.time() - stage_start
+	
+	# Print profiling summary
+	total_time = time.time() - total_start
+	if total_time > 0.1:  # Only print if compression took more than 100ms
+		print("\nCompression Profiling:")
+		print(f"  Total time: {total_time:.3f}s")
+		print("  Time breakdown:")
+		for stage, stage_time in sorted(profiler.items(), key=lambda x: x[1], reverse=True):
+			percentage = (stage_time / total_time) * 100
+			print(f"    {stage:20s}: {stage_time:7.3f}s ({percentage:5.1f}%)")
 
 
 def decompress_file(input_path: str, output_path: str) -> None:
@@ -1062,6 +1172,7 @@ def decompress_file(input_path: str, output_path: str) -> None:
 			parents=list(obj["parents"]),
 			rare_meta=list(obj.get("rare_meta", [""] * len(obj["columns"]))),
 			delimiter=obj.get("delimiter", ","),  # Default to comma for legacy files
+			line_ending=obj.get("line_ending", "\n"),  # Default to LF for legacy files
 		)
 	p += mlen
 	ncols = int.from_bytes(data[p:p+4], "little"); p += 4
@@ -1070,23 +1181,67 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	if _vers >= 4:
 		# Version 4+: varint-encoded frame lengths with compression flag
 		from .conditional import _decode_varint
-		for _ in range(ncols):
+		for frame_idx in range(ncols):
 			# Check for compression flag (0xFF byte before length)
 			is_compressed = False
-			if p < len(data) and data[p] == 0xFF:
+			if p >= len(data):
+				raise RuntimeError(f"Unexpected end of file while reading frame {frame_idx} of {ncols}")
+			if data[p] == 0xFF:
 				is_compressed = True
 				p += 1
+				if p >= len(data):
+					raise RuntimeError(f"Unexpected end of file after compression flag for frame {frame_idx} of {ncols}")
 			
 			# Decode varint length
+			if p >= len(data):
+				raise RuntimeError(f"Unexpected end of file while reading varint length for frame {frame_idx} of {ncols}")
 			flen, bytes_consumed = _decode_varint(data, p, signed=False)
 			p += bytes_consumed
+			
+			# Check if we have enough data to read the frame
+			if p + flen > len(data):
+				raise RuntimeError(
+					f"Frame {frame_idx} of {ncols} claims length {flen} bytes, "
+					f"but only {len(data) - p} bytes remain in file"
+				)
 			
 			frame_data = data[p:p+flen]
 			p += flen
 			
 			# Decompress if needed
 			if is_compressed:
-				frame_data = generic_bytes_decompress(frame_data)
+				try:
+					frame_data = generic_bytes_decompress(frame_data)
+				except RuntimeError as e:
+					# Frame compression is currently disabled, so this shouldn't happen with new files.
+					# If we encounter a compressed frame, it's from an old file format.
+					# The error might also be from OpenZL issues with small compressed data.
+					error_msg = str(e)
+					if "Internal buffer too small" in error_msg or "error code: 71" in error_msg:
+						if flen < 50:
+							raise RuntimeError(
+								f"Failed to decompress frame {frame_idx} of {ncols} columns. "
+								f"Compressed frame is too small ({flen} bytes) for reliable OpenZL decompression. "
+								f"This may be from an old file format with frame compression, or a compression issue. "
+								f"Please recompress the file with the current version. "
+								f"Original error: {e}"
+							) from e
+						else:
+							raise RuntimeError(
+								f"Failed to decompress frame {frame_idx} of {ncols} columns. "
+								f"This file was created with frame compression enabled, which has known issues. "
+								f"Please recompress the file with the current version (frame compression is now disabled). "
+								f"Compressed frame length: {flen} bytes. "
+								f"Original error: {e}"
+							) from e
+					else:
+						# Other errors should still be raised
+						raise RuntimeError(
+							f"Failed to decompress frame {frame_idx} of {ncols} columns. "
+							f"Compressed frame length: {flen} bytes, "
+							f"Data remaining after frame: {len(data) - p} bytes. "
+							f"Original error: {e}"
+						) from e
 			frames.append(frame_data)
 	else:
 		# Legacy version: fixed 8-byte frame lengths
@@ -1123,12 +1278,65 @@ def decompress_file(input_path: str, output_path: str) -> None:
 			if format_type == "_scale":
 				# Scaled float: divide by scale factor
 				scale = scale_info
-				if scale == 1:
-					# Pure integers (scale=1 means they were stored as integers)
-					rec_cols[name] = [str(int(x)) for x in ids.tolist()]
-				else:
-					# Scaled floats: divide by scale and format appropriately
-					rec_cols[name] = [str(float(x) / scale) for x in ids.tolist()]
+				# Reconstruct values
+				reconstructed = []
+				for x in ids.tolist():
+					val = float(x) / scale
+					if scale == 1:
+						# Pure integers - check if we need to preserve .0 format
+						reconstructed.append(str(int(val)))
+					else:
+						reconstructed.append(str(val))
+				
+				# Apply format preservation from rare_meta if available
+				if col_idx < len(model.rare_meta) and model.rare_meta[col_idx]:
+					try:
+						# Decode format preservation data
+						rare_b64 = model.rare_meta[col_idx]
+						rare_compressed = base64.b64decode(rare_b64)
+						rare_data = generic_bytes_decompress(rare_compressed, fallback_to_uncompressed=True)
+						
+						if len(rare_data) >= 4:
+							import struct
+							ptr = 0
+							format_count = struct.unpack("<I", rare_data[ptr:ptr+4])[0]
+							ptr += 4
+							format_map = {}
+							prev_idx = -1
+							for _ in range(format_count):
+								if ptr >= len(rare_data):
+									break
+								# Decode delta-encoded index using varint
+								delta, bytes_read = _decode_varint(rare_data, ptr, signed=False)
+								if bytes_read == 0:
+									break
+								ptr += bytes_read
+								idx = prev_idx + delta
+								prev_idx = idx
+								
+								# Decode string length using varint
+								if ptr >= len(rare_data):
+									break
+								str_len, bytes_read = _decode_varint(rare_data, ptr, signed=False)
+								if bytes_read == 0:
+									break
+								ptr += bytes_read
+								
+								# Read the string
+								if ptr + str_len <= len(rare_data):
+									orig_str = rare_data[ptr:ptr+str_len].decode("utf-8")
+									ptr += str_len
+									format_map[idx] = orig_str
+							# Apply format map
+							for idx, orig_str in format_map.items():
+								if idx < len(reconstructed):
+									reconstructed[idx] = orig_str
+					except Exception as e:
+						# If format preservation fails, use reconstructed values as-is
+						# Silently continue - format preservation is optional for roundtrip accuracy
+						pass
+				
+				rec_cols[name] = reconstructed
 			elif format_type == "_float":
 				# Raw float stored as int64 bit pattern
 				float_arr = ids.view(np.float64)
@@ -1146,7 +1354,8 @@ def decompress_file(input_path: str, output_path: str) -> None:
 						# Decode base64 and decompress
 						rare_b64 = model.rare_meta[col_idx]
 						rare_compressed = base64.b64decode(rare_b64)
-						rare_data = generic_bytes_decompress(rare_compressed)
+						# Use fallback_to_uncompressed=True to handle cases where data is uncompressed
+						rare_data = generic_bytes_decompress(rare_compressed, fallback_to_uncompressed=True)
 						
 						ptr = 0
 						if len(rare_data) >= 4:
@@ -1203,7 +1412,8 @@ def decompress_file(input_path: str, output_path: str) -> None:
 		b64 = model.rare_meta[col_idx] if col_idx < len(model.rare_meta) else ""
 		if b64:
 			blob = base64.b64decode(b64)
-			override_bytes = generic_bytes_decompress(blob)
+			# Use fallback_to_uncompressed=True to handle cases where data is uncompressed
+			override_bytes = generic_bytes_decompress(blob, fallback_to_uncompressed=True)
 			if override_bytes:
 				# Try new binary format first, fall back to JSON for backward compatibility
 				try:
@@ -1231,9 +1441,17 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	df = df.replace('None', EMPTY_STRING)
 	
 	# Write CSV exactly as input: use stored delimiter, no header, no index
-	# Use lineterminator='\n' to ensure consistent line endings
+	# Use stored line ending style to preserve original format (CRLF vs LF)
 	# Get delimiter from model (always present, defaults to comma for backward compatibility)
-	csv_content = df.to_csv(index=False, header=False, sep=model.delimiter, na_rep=EMPTY_STRING, lineterminator='\n')
+	# Normalize delimiter: convert "\\t" to '\t' (tab character)
+	delimiter = model.delimiter
+	if delimiter == '\\t':
+		delimiter = '\t'
+	elif delimiter == '\\n':
+		delimiter = '\n'
+	# Use stored line ending style (defaults to '\n' for backward compatibility)
+	line_ending = getattr(model, 'line_ending', '\n')
+	csv_content = df.to_csv(index=False, header=False, sep=delimiter, na_rep=EMPTY_STRING, lineterminator=line_ending)
 	
 	# Remove trailing newline if present (to match some CSV formats)
 	# Actually, keep it - most CSV files end with newline

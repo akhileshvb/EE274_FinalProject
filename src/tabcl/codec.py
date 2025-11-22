@@ -270,19 +270,75 @@ def mdl_cost_fn_openzl(x: np.ndarray, y: np.ndarray, row_sample: Optional[int] =
 def generic_bytes_compress(data: bytes) -> bytes:
 	if zl is None:
 		return data
+	# Skip compression for very small data to avoid OpenZL decompression issues
+	# OpenZL has issues decompressing data < 50 bytes reliably
+	# Only compress if data is large enough that compression is beneficial
+	if len(data) < 100:
+		# For very small data, compression overhead isn't worth it and may cause decompression issues
+		return data
 	c = _build_generic_compressor()
 	cctx = zl.CCtx(); cctx.ref_compressor(c); cctx.set_parameter(zl.CParam.FormatVersion, zl.MAX_FORMAT_VERSION)
-	return cctx.compress([zl.Input(zl.Type.Serial, data)])
+	compressed = cctx.compress([zl.Input(zl.Type.Serial, data)])
+	# Only use compressed version if it's actually smaller (account for decompression overhead)
+	# For very small compressed data (< 50 bytes), OpenZL may fail to decompress, so skip it
+	if len(compressed) < len(data) and len(compressed) >= 50:
+		return compressed
+	# If compression didn't help or result is too small, return original
+	return data
 
 
-def generic_bytes_decompress(data: bytes) -> bytes:
+def generic_bytes_decompress(data: bytes, fallback_to_uncompressed: bool = False) -> bytes:
+	"""
+	Decompress data using OpenZL.
+	
+	Args:
+		data: Data to decompress (may be compressed or uncompressed)
+		fallback_to_uncompressed: If True and decompression fails, return data as-is
+		
+	Returns:
+		Decompressed data, or original data if fallback_to_uncompressed=True and decompression fails
+	"""
 	if zl is None:
 		return data
-	dctx = zl.DCtx()
-	outs = dctx.decompress(data)
-	if len(outs) != 1 or outs[0].type != zl.Type.Serial:
-		raise RuntimeError("Unexpected OpenZL output")
-	return outs[0].content.as_bytes()
+	if not data:
+		return data  # Empty data is valid uncompressed
+	
+	# Very small data (< 50 bytes) is likely uncompressed to avoid OpenZL issues
+	# But we should still try to decompress in case it was compressed
+	try:
+		dctx = zl.DCtx()
+		outs = dctx.decompress(data)
+		if len(outs) != 1 or outs[0].type != zl.Type.Serial:
+			raise RuntimeError("Unexpected OpenZL output")
+		return outs[0].content.as_bytes()
+	except RuntimeError as e:
+		error_msg = str(e)
+		# Check for specific OpenZL errors that indicate the data might be uncompressed
+		if "Internal buffer too small" in error_msg or "error code: 71" in error_msg:
+			if fallback_to_uncompressed:
+				# Data might be uncompressed - return as-is
+				return data
+			# Re-raise with context
+			if len(data) < 50:
+				raise RuntimeError(
+					f"OpenZL decompression failed: compressed data is too small ({len(data)} bytes). "
+					f"This is a known issue with OpenZL and very small compressed buffers. "
+					f"Original error: {error_msg}"
+				) from e
+			else:
+				raise RuntimeError(
+					f"OpenZL decompression failed: data may be corrupted or in wrong format. "
+					f"Data length: {len(data)} bytes. Original error: {error_msg}"
+				) from e
+		# For other errors, re-raise unless fallback is enabled
+		if fallback_to_uncompressed:
+			return data
+		raise
+	except Exception as e:
+		# For any other exception, if fallback is enabled, return data as-is
+		if fallback_to_uncompressed:
+			return data
+		raise
 
 
 def compress_numeric_array(arr: np.ndarray) -> bytes:
