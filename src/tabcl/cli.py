@@ -4,7 +4,7 @@ import sys
 import base64
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -1088,7 +1088,16 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		normalized_delimiter = '\t'
 	elif delimiter == '\\n':
 		normalized_delimiter = '\n'
-	model = Model(columns=list(df.columns), edges=[[int(u), int(v), float(w)] for u, v, w in edges], dicts=dicts, parents=parents, rare_meta=rare_b64, delimiter=normalized_delimiter, line_ending=line_ending)
+	
+	model = Model(
+		columns=list(df.columns),
+		edges=[[int(u), int(v), float(w)] for u, v, w in edges],
+		dicts=dicts,
+		parents=parents,
+		rare_meta=rare_b64,
+		delimiter=normalized_delimiter,
+		line_ending=line_ending
+	)
 	# Store is_numeric as a separate metadata field by encoding in rare_meta
 	# Actually, we can infer it from dicts (None = numeric), so we don't need to store it separately
 
@@ -1097,7 +1106,10 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	profiler["serialize_model"] = time.time() - stage_start
 	
 	stage_start = time.time()
+	
+	# Encode columns
 	frames: List[bytes] = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1)
+	
 	profiler["encode_columns"] = time.time() - stage_start
 
 	# Compress frames with an additional layer for better compression
@@ -1251,6 +1263,7 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	if n_rows is None:
 		raise RuntimeError("Could not determine row count")
 
+	# Decode columns
 	indices = decode_columns_with_parents(frames, model.parents, n_rows)
 
 	rec_cols: Dict[str, Any] = {}

@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -412,7 +412,7 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 					# Fallback
 					use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
 					fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
-			elif segment.size > 1:
+			else:
 				# For very small segments (2-3), still try multiple methods for best compression
 				candidates = []
 				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
@@ -447,11 +447,6 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 					# Fallback
 					use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
 					fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
-			else:
-				# Single element - just compress it
-				prefer_delta_base = dicts[j] is None or isinstance(dicts[j], tuple)
-				use_ace, prefer_delta = _choose_best_compression(segment, dicts[j], prefer_delta_base)
-				fb = compress_numeric_array_fast(segment, use_ace, prefer_delta=prefer_delta)
 			
 			# Use variable-length encoding for parent ID and length to save space
 			# For small parent IDs and lengths, use fewer bytes
@@ -462,7 +457,7 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 			length_bytes = _encode_varint(len(fb), signed=False)
 			parts.append(length_bytes)
 			parts.append(fb)
-			
+		
 		frames[j] = b"".join(parts)
 
 	with ThreadPoolExecutor(max_workers=workers) as ex:
