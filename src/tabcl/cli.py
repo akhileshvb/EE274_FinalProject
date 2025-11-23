@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from .forest import build_mdl_weighted_forest
 from .codec import mdl_cost_fn_openzl, mdl_cost_fn_fast, generic_bytes_compress, generic_bytes_decompress
+from .forest import build_mdl_weighted_forest_two_phase, build_maximum_weight_forest
 from .conditional import orient_forest, encode_columns_with_parents, decode_columns_with_parents, _encode_varint, _decode_varint
 
 
@@ -920,6 +920,11 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 			skip_high_card.add(i)
 	profiler["cardinality_check"] = time.time() - stage_start
 	
+	# Build MDL-weighted forest using two-phase approach
+	# The function returns (phase1_edges, refined_edges) for separate timing
+	# We need to time phase1 and phase2 separately, so we'll do it in two calls
+	# Actually, let's refactor to time inside the function or split the phases
+	# For now, let's keep the existing inline code but move the forest building part
 	# Phase 1: Fast ranking with proxy MDL on all edge pairs
 	# For datasets <= 10k rows, can afford to use exact MI throughout for better accuracy
 	use_exact_mi_phase1 = (n_rows <= 10000)
@@ -1059,28 +1064,15 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	refined_edges = [(u, v, w) for u, v, w in refined_edges if w > 0.0]
 	profiler["phase2_mi"] = time.time() - stage_start
 	
-	# Build maximum-weight forest - keep all positive-weight edges that don't create cycles
-	# The paper optimizes over all forests, so we use greedy algorithm (Kruskal's for forests)
-	# This is optimal: we get maximum total weight while maintaining acyclic structure
-	import networkx as nx
-	G = nx.Graph()
-	G.add_nodes_from(range(n_cols))
-	# Sort edges by weight (descending) and add them greedily - this is optimal for forests
-	refined_edges_sorted = sorted(refined_edges, key=lambda x: x[2], reverse=True)
-	edges = []
-	for u, v, w in refined_edges_sorted:
-		# Check if adding this edge would create a cycle
-		# If u and v are in different connected components, it's safe to add
-		if not nx.has_path(G, u, v):
-			G.add_edge(u, v, weight=w)
-			edges.append((u, v, w))
+	# Build maximum-weight forest from refined edges using function from forest.py
+	stage_start = time.time()
+	edges = build_maximum_weight_forest(n_cols, refined_edges)
+	profiler["build_forest"] = time.time() - stage_start
 	
-	# The greedy algorithm above produces a maximum-weight forest
-	# If no edges were added, we have isolated nodes (each is its own tree)
-	# This is correct behavior for a forest
+	# Orient forest to get parent array
 	stage_start = time.time()
 	parents = orient_forest(len(df.columns), [(int(u), int(v), float(w)) for u, v, w in edges])
-	profiler["build_forest"] = time.time() - stage_start
+	profiler["build_forest"] += time.time() - stage_start
 	
 	stage_start = time.time()
 	indices, dicts, rare_blobs, is_numeric = _tokenize_columns(df, rare_threshold=rare_threshold)
