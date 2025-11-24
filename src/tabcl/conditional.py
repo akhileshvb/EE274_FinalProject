@@ -1,5 +1,6 @@
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
+import struct
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from .codec import (
@@ -263,7 +264,7 @@ def _try_all_compression_methods(arr: np.ndarray, dict_info: Any) -> bytes:
 	return candidates[0][1]
 
 
-def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], dicts: List[Any], workers: int | None = None) -> List[bytes]:
+def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], dicts: List[Any], workers: int | None = None, use_mlp: bool = False) -> Tuple[List[bytes], List[Optional[bytes]]]:
 	"""
 	Encode each column:
 	- roots: single numeric frame (ACE if low-cardinality)
@@ -460,13 +461,111 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 		
 		frames[j] = b"".join(parts)
 
-	with ThreadPoolExecutor(max_workers=workers) as ex:
-		list(ex.map(encode_child, child_ids))
+	# MLP models list (one per column, None if histogram used)
+	mlp_models: List[Optional[bytes]] = [None] * len(indices)
+	
+	if use_mlp:
+		# Try MLP for child columns
+		from .mlp_conditional import compare_mlp_vs_histogram_mdl
+		from .codec import mdl_cost_fn_openzl
+		
+		def try_mlp_for_child(j: int) -> None:
+			"""Try MLP encoding for a child column and update frame if beneficial."""
+			arr = indices[j]
+			p = parents[j]
+			parent_ids = indices[p]
+			
+			# Skip if too many unique values (MLP not suitable)
+			unique_children = len(np.unique(arr))
+			if unique_children > 10000 or unique_children < 2:
+				return
+			
+			# Compute actual histogram encoding cost by doing a dry-run
+			# This gives us the real compressed size
+			pids = parent_ids.astype(np.int64, copy=False)
+			order = np.argsort(pids)
+			sorted_pids = pids[order]
+			sorted_vals = arr.astype(np.int64, copy=False)[order]
+			uniq, starts = np.unique(sorted_pids, return_index=True)
+			
+			# Compute histogram model cost (metadata overhead)
+			sample_size = min(10000, len(arr))
+			if sample_size < len(arr):
+				idx = np.random.choice(len(arr), size=sample_size, replace=False)
+				x_sample = parent_ids[idx]
+				y_sample = arr[idx]
+			else:
+				x_sample = parent_ids
+				y_sample = arr
+			hist_model_bits = mdl_cost_fn_openzl(x_sample, y_sample, row_sample=None, seed=0)
+			
+			# Compute actual histogram data cost by encoding segments
+			hist_data_bits = 0.0
+			# Frame header: CND marker (4 bytes) + nbuckets (4 bytes)
+			hist_data_bits += 8 * 8.0
+			for k, pid in enumerate(uniq.tolist()):
+				start = starts[k]
+				end = starts[k + 1] if k + 1 < len(starts) else sorted_pids.size
+				segment = sorted_vals[start:end]
+				
+				# Try all compression methods and get the best
+				segment_compressed = _try_all_compression_methods(segment, dicts[j])
+				
+				# Add overhead: varint for parent ID + varint for length
+				pid_varint_len = len(_encode_varint(pid, signed=False))
+				length_varint_len = len(_encode_varint(len(segment_compressed), signed=False))
+				hist_data_bits += (pid_varint_len + length_varint_len + len(segment_compressed)) * 8.0
+			
+			hist_total_bits = hist_model_bits + hist_data_bits
+			
+			# Compare MLP vs histogram
+			# Use a small negative margin to favor MLP when it's close (helps with learning)
+			# But require it to be at least competitive
+			use_mlp_flag, model, mlp_total = compare_mlp_vs_histogram_mdl(
+				child_indices=arr,
+				parent_indices=parent_ids,
+				histogram_model_bits=hist_model_bits,
+				histogram_data_bits=hist_data_bits,
+				margin=-50.0,  # Small negative margin: prefer MLP if within 50 bits
+			)
+			
+			if use_mlp_flag and model is not None:
+				# Encode with MLP
+				from .mlp_conditional import encode_column_with_mlp
+				from .tiny_mlp import serialize_mlp_params
+				
+				encoded_data, mlp_model, _ = encode_column_with_mlp(
+					child_indices=arr,
+					parent_indices=parent_ids,
+					dicts=dicts[j],
+				)
+				
+				if encoded_data is not None and mlp_model is not None:
+					# Serialize MLP model
+					mlp_params = serialize_mlp_params(mlp_model)
+					mlp_models[j] = mlp_params
+					
+					# Create frame with MLP marker
+					mlp_frame = b"MLP\x00" + struct.pack("<I", len(encoded_data)) + encoded_data
+					frames[j] = mlp_frame
+		
+		# Try MLP for child columns in parallel
+		with ThreadPoolExecutor(max_workers=workers) as ex:
+			list(ex.map(try_mlp_for_child, child_ids))
+		
+		# Encode remaining children with histogram method
+		remaining_children = [j for j in child_ids if mlp_models[j] is None]
+		with ThreadPoolExecutor(max_workers=workers) as ex:
+			list(ex.map(encode_child, remaining_children))
+	else:
+		# Standard histogram encoding
+		with ThreadPoolExecutor(max_workers=workers) as ex:
+			list(ex.map(encode_child, child_ids))
 
-	return frames
+	return frames, mlp_models
 
 
-def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows: int) -> List[np.ndarray]:
+def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows: int, mlp_models: Optional[List[Optional[bytes]]] = None) -> List[np.ndarray]:
 	"""
 	Inverse of encode_columns_with_parents. Reconstruct each column's indices array.
 	Decodes roots first, then iteratively decodes children whose parent is already available.
@@ -494,6 +593,28 @@ def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows:
 			p = parents[j]
 			parent_ids = indices[p]
 			frame = frames[j]
+			
+			# Check for MLP-encoded frame
+			if frame[:4] == b"MLP\x00":
+				if mlp_models is None or mlp_models[j] is None:
+					raise RuntimeError(f"MLP model missing for column {j}")
+				
+				# Deserialize MLP model
+				from .tiny_mlp import deserialize_mlp_params
+				_, model = deserialize_mlp_params(mlp_models[j])
+				
+				# Decode MLP frame
+				ptr = 4
+				data_len = struct.unpack("<I", frame[ptr:ptr+4])[0]
+				ptr += 4
+				encoded_data = frame[ptr:ptr+data_len]
+				
+				from .mlp_conditional import decode_column_with_mlp
+				indices[j] = decode_column_with_mlp(encoded_data, model, parent_ids, n_rows)
+				undecoded.discard(j)
+				progress = True
+				continue
+			
 			if frame[:4] != b"CND\x00":
 				indices[j] = decompress_numeric_array(frame)
 				undecoded.discard(j)

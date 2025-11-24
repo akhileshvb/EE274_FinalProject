@@ -23,6 +23,7 @@ class Model:
 	rare_meta: List[str]
 	delimiter: str = ","  # CSV delimiter (default comma for backward compatibility)
 	line_ending: str = "\n"  # Line ending style: "\n" (LF) or "\r\n" (CRLF)
+	mlp_models: Optional[List[Optional[bytes]]] = None  # Serialized MLP models (one per column, None if histogram used)
 
 	def to_bytes(self) -> bytes:
 		# Optimize dictionary storage: store dictionaries as compact binary format
@@ -90,6 +91,25 @@ class Model:
 			weight_scaled = max(-32768, min(32767, int(w * 1000)))
 			edges_optimized.append([int(u), int(v), weight_scaled])
 		
+		# Encode MLP models if present
+		mlp_models_encoded = None
+		if self.mlp_models is not None:
+			mlp_models_encoded = []
+			for mlp_model in self.mlp_models:
+				if mlp_model is None:
+					mlp_models_encoded.append(None)
+				else:
+					# mlp_model should already be bytes from serialize_mlp_params
+					# Compress and base64 encode MLP model parameters
+					if isinstance(mlp_model, bytes):
+						mlp_compressed = generic_bytes_compress(mlp_model)
+						mlp_models_encoded.append(base64.b64encode(mlp_compressed).decode("ascii"))
+					else:
+						# Fallback: convert to bytes if needed
+						mlp_bytes = bytes(mlp_model) if hasattr(mlp_model, '__iter__') else str(mlp_model).encode()
+						mlp_compressed = generic_bytes_compress(mlp_bytes)
+						mlp_models_encoded.append(base64.b64encode(mlp_compressed).decode("ascii"))
+		
 		# For other fields, use JSON but optimize
 		obj = {
 			"columns": base64.b64encode(columns_compressed).decode("ascii"),  # Compressed binary
@@ -100,6 +120,8 @@ class Model:
 			"delimiter": self.delimiter,
 			"line_ending": self.line_ending,  # Preserve line ending style
 		}
+		if mlp_models_encoded is not None:
+			obj["mlp_models"] = mlp_models_encoded
 		json_bytes = json.dumps(obj, separators=(",", ":")).encode("utf-8")
 		# Compress the model metadata to reduce overhead
 		return generic_bytes_compress(json_bytes)
@@ -209,6 +231,19 @@ class Model:
 				# Fallback: treat as-is (shouldn't happen)
 				dicts_deserialized.append(d)
 		
+		# Decode MLP models if present
+		mlp_models_deserialized = None
+		if "mlp_models" in obj:
+			mlp_models_deserialized = []
+			for mlp_model_encoded in obj["mlp_models"]:
+				if mlp_model_encoded is None:
+					mlp_models_deserialized.append(None)
+				else:
+					# Decode base64 and decompress
+					mlp_compressed = base64.b64decode(mlp_model_encoded.encode("ascii"))
+					mlp_model = generic_bytes_decompress(mlp_compressed, fallback_to_uncompressed=True)
+					mlp_models_deserialized.append(mlp_model)
+		
 		return Model(
 			columns=columns,
 			edges=edges,
@@ -216,6 +251,7 @@ class Model:
 			parents=list(obj["parents"]),
 			rare_meta=list(obj.get("rare_meta", [""] * len(columns))),
 			delimiter=obj.get("delimiter", ","),  # Default to comma for backward compatibility
+			mlp_models=mlp_models_deserialized,
 			line_ending=obj.get("line_ending", "\n"),  # Default to LF for backward compatibility
 		)
 
@@ -860,7 +896,7 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 	output_path.write_text(df.to_csv(index=False))
 
 
-def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None) -> None:
+def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False) -> None:
 	import time
 	profiler = {}  # Track time spent in each stage
 	total_start = time.time()
@@ -1102,15 +1138,23 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	# Actually, we can infer it from dicts (None = numeric), so we don't need to store it separately
 
 	stage_start = time.time()
+	# Initial model serialization (will be updated with MLP models after encoding)
 	model_bytes = model.to_bytes()
 	profiler["serialize_model"] = time.time() - stage_start
 	
 	stage_start = time.time()
 	
 	# Encode columns
-	frames: List[bytes] = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1)
+	frames: List[bytes]
+	mlp_models: List[Optional[bytes]]
+	frames, mlp_models = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1, use_mlp=use_mlp)
 	
 	profiler["encode_columns"] = time.time() - stage_start
+	
+	# Update model with MLP models and re-serialize
+	if use_mlp:
+		model.mlp_models = mlp_models
+		model_bytes = model.to_bytes()
 
 	# Compress frames with an additional layer for better compression
 	# This helps especially when frames have redundancy or patterns
@@ -1264,7 +1308,7 @@ def decompress_file(input_path: str, output_path: str) -> None:
 		raise RuntimeError("Could not determine row count")
 
 	# Decode columns
-	indices = decode_columns_with_parents(frames, model.parents, n_rows)
+	indices = decode_columns_with_parents(frames, model.parents, n_rows, mlp_models=model.mlp_models)
 
 	rec_cols: Dict[str, Any] = {}
 	EMPTY_STRING = ""
@@ -1482,6 +1526,7 @@ def main() -> None:
 	pc.add_argument("--mi-sample", type=int, default=None, help="Row sample size for MI (optional)")
 	pc.add_argument("--mi-seed", type=int, default=0, help="Random seed for MI sampling")
 	pc.add_argument("--workers", type=int, default=None, help="Parallel workers for column/bucket compression")
+	pc.add_argument("--use-mlp", action="store_true", help="Use tiny MLP models for conditional compression (experimental)")
 
 	pdcp = sub.add_parser("decompress", help="Decompress to CSV")
 	pdcp.add_argument("--input", required=True)
@@ -1492,7 +1537,7 @@ def main() -> None:
 	if args.cmd == "prepare":
 		_prepare_raw_to_csv(Path(args.input), Path(args.output), header=args.has_header)
 	elif args.cmd == "compress":
-		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers)
+		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp)
 	elif args.cmd == "decompress":
 		decompress_file(args.input, args.output)
 	else:

@@ -1,0 +1,581 @@
+"""
+Tiny MLP extension for MDL tabular compression.
+
+Implements a small multi-layer perceptron (MLP) that can replace histogram-based
+conditional compression for certain columns when MDL indicates it's beneficial.
+"""
+
+from typing import List, Tuple, Optional, Dict, Any
+import numpy as np
+import struct
+import json
+from collections import Counter
+
+try:
+	import torch
+	import torch.nn as nn
+	import torch.optim as optim
+	TORCH_AVAILABLE = True
+except ImportError:
+	TORCH_AVAILABLE = False
+	torch = None
+	nn = None
+	optim = None
+
+
+class TinyMLP(nn.Module):
+	"""
+	Tiny MLP for conditional probability estimation.
+	
+	Architecture:
+	- Embedding layers for categorical features
+	- 1-2 hidden layers (32-64 units)
+	- Output layer with softmax over child column classes
+	"""
+	
+	def __init__(
+		self,
+		embedding_dims: List[int],  # Embedding dimension for each categorical feature
+		embedding_vocab_sizes: List[int],  # Vocabulary size for each categorical feature
+		hidden_dims: List[int] = [64],  # Hidden layer dimensions
+		num_classes: int = 0,  # Number of classes in child column
+		use_gelu: bool = True,  # Use GELU activation (True) or ReLU (False)
+	):
+		if not TORCH_AVAILABLE:
+			raise ImportError("PyTorch is required for MLP extension. Install with: pip install torch")
+		
+		super().__init__()
+		
+		self.embedding_dims = embedding_dims
+		self.embedding_vocab_sizes = embedding_vocab_sizes
+		self.hidden_dims = hidden_dims
+		self.num_classes = num_classes
+		self.use_gelu = use_gelu
+		
+		# Embedding layers for categorical features
+		self.embeddings = nn.ModuleList([
+			nn.Embedding(vocab_size, emb_dim)
+			for vocab_size, emb_dim in zip(embedding_vocab_sizes, embedding_dims)
+		])
+		
+		# Compute input dimension: sum of all embedding dimensions
+		input_dim = sum(embedding_dims)
+		
+		# Build hidden layers
+		layers = []
+		prev_dim = input_dim
+		for hidden_dim in hidden_dims:
+			layers.append(nn.Linear(prev_dim, hidden_dim))
+			layers.append(nn.GELU() if use_gelu else nn.ReLU())
+			prev_dim = hidden_dim
+		
+		# Output layer
+		layers.append(nn.Linear(prev_dim, num_classes))
+		# Note: We'll apply softmax during inference, not in the model
+		
+		self.mlp = nn.Sequential(*layers)
+	
+	def forward(self, feature_indices: List[torch.Tensor]) -> torch.Tensor:
+		"""
+		Forward pass.
+		
+		Args:
+			feature_indices: List of tensors, one per categorical feature.
+			                 Each tensor contains indices (long) of shape [batch_size]
+		
+		Returns:
+			Logits of shape [batch_size, num_classes]
+		"""
+		# Embed each feature
+		embedded = []
+		for i, indices in enumerate(feature_indices):
+			emb = self.embeddings[i](indices)
+			embedded.append(emb)
+		
+		# Concatenate all embeddings
+		x = torch.cat(embedded, dim=1)
+		
+		# Pass through MLP
+		logits = self.mlp(x)
+		
+		return logits
+	
+	def predict_proba(self, feature_indices: List[torch.Tensor]) -> np.ndarray:
+		"""
+		Predict probability distribution over classes.
+		
+		Args:
+			feature_indices: List of tensors with feature indices
+		
+		Returns:
+			Probability array of shape [batch_size, num_classes]
+		"""
+		self.eval()
+		with torch.no_grad():
+			logits = self.forward(feature_indices)
+			probs = torch.softmax(logits, dim=1)
+			return probs.cpu().numpy()
+
+
+def train_tiny_mlp(
+	child_indices: np.ndarray,
+	parent_indices: np.ndarray,
+	embedding_dim: int = 16,
+	hidden_dims: List[int] = [64],
+	num_epochs: int = 15,  # Increased for better learning
+	batch_size: int = 2048,
+	learning_rate: float = 0.001,
+	max_samples: Optional[int] = 50000,
+	device: Optional[str] = None,
+	all_unique_children: Optional[np.ndarray] = None,  # All unique child values from full dataset
+	all_unique_parents: Optional[np.ndarray] = None,  # All unique parent values from full dataset
+) -> Optional[TinyMLP]:
+	"""
+	Train a tiny MLP to predict child column from parent column.
+	
+	Args:
+		child_indices: Array of child column class indices [n_rows]
+		parent_indices: Array of parent column class indices [n_rows]
+		embedding_dim: Dimension for parent embedding
+		hidden_dims: Hidden layer dimensions
+		num_epochs: Number of training epochs
+		batch_size: Batch size for training
+		learning_rate: Learning rate
+		max_samples: Maximum number of samples to use for training (None = all)
+		device: Device to use ('cpu', 'mps', 'cuda', or None for auto)
+	
+	Returns:
+		Trained TinyMLP model, or None if training fails or is skipped
+	"""
+	if not TORCH_AVAILABLE:
+		return None
+	
+	if len(child_indices) < 100:
+		# Too small to train
+		return None
+	
+	# Sample if needed
+	n_rows = len(child_indices)
+	if max_samples is not None and n_rows > max_samples:
+		idx = np.random.choice(n_rows, size=max_samples, replace=False)
+		child_sample = child_indices[idx]
+		parent_sample = parent_indices[idx]
+	else:
+		child_sample = child_indices
+		parent_sample = parent_indices
+	
+	# Get vocabulary sizes
+	# Use all unique values from full dataset if provided, otherwise use sample
+	if all_unique_parents is not None:
+		unique_parents_list = all_unique_parents
+	else:
+		unique_parents_list = np.unique(parent_sample)
+	
+	if all_unique_children is not None:
+		unique_children_list = all_unique_children
+	else:
+		unique_children_list = np.unique(child_sample)
+	
+	# Filter out -1 (sentinel value) from unique lists
+	# -1 is used as a sentinel in the codebase (e.g., for missing parents)
+	# and should not be included in the MLP model's vocabulary
+	unique_children_list = unique_children_list[unique_children_list != -1]
+	unique_parents_list = unique_parents_list[unique_parents_list != -1]
+	
+	unique_parents = len(unique_parents_list)
+	unique_children = len(unique_children_list)
+	
+	# Skip if too many classes (would require huge output layer)
+	if unique_children > 10000:
+		return None
+	
+	# Map to 0-indexed contiguous integers
+	# Use all unique values to ensure mapping covers full dataset
+	# IMPORTANT: -1 is a sentinel value and should NOT be in the map
+	# If we encounter -1 during encoding/decoding, we'll handle it specially
+	parent_map = {v: i for i, v in enumerate(unique_parents_list) if v != -1}
+	child_map = {v: i for i, v in enumerate(unique_children_list) if v != -1}
+	
+	# Verify -1 is not in the maps
+	if -1 in parent_map or -1 in child_map:
+		raise RuntimeError("ERROR: -1 (sentinel value) found in parent_map or child_map! This should not happen.")
+	
+	# Verify that child_map is complete (all values in [0, len(unique_children_list)-1] should be present)
+	# This is a sanity check - if this fails, there's a bug
+	expected_mapped_values = set(range(len(unique_children_list)))
+	actual_mapped_values = set(child_map.values())
+	if expected_mapped_values != actual_mapped_values:
+		missing = expected_mapped_values - actual_mapped_values
+		raise RuntimeError(
+			f"Child map is incomplete during training: missing mapped values {sorted(list(missing))[:20]}. "
+			f"Expected {len(unique_children_list)} values, got {len(actual_mapped_values)}"
+		)
+	
+	# Map parent and child samples, handling -1 (sentinel) values
+	# -1 should not be in the maps, so we need to filter it out or handle it specially
+	parent_mapped = np.array([
+		parent_map.get(v, -1) if v != -1 else -1 for v in parent_sample
+	], dtype=np.int64)
+	child_mapped = np.array([
+		child_map.get(v, -1) if v != -1 else -1 for v in child_sample
+	], dtype=np.int64)
+	
+	# Filter out rows where parent or child is -1 (sentinel value)
+	valid_mask = (parent_mapped != -1) & (child_mapped != -1)
+	if not np.any(valid_mask):
+		# All rows have sentinel values - can't train
+		return None
+	
+	parent_mapped = parent_mapped[valid_mask]
+	child_mapped = child_mapped[valid_mask]
+	
+	if len(parent_mapped) < 100:
+		# Too few valid rows after filtering
+		return None
+	
+	# Determine device - use CPU for stability (MPS has issues with some operations)
+	# Users can override by passing device explicitly
+	if device is None:
+		device = 'cpu'  # Default to CPU for stability
+		# Uncomment below to use MPS/CUDA if available (but may have issues)
+		# if torch.backends.mps.is_available():
+		# 	device = 'mps'
+		# elif torch.cuda.is_available():
+		# 	device = 'cuda'
+	
+	# Create model on CPU first, then move to device
+	# This avoids MPS device issues during initialization
+	model = TinyMLP(
+		embedding_dims=[embedding_dim],
+		embedding_vocab_sizes=[unique_parents],
+		hidden_dims=hidden_dims,
+		num_classes=unique_children,
+		use_gelu=True
+	)
+	# Move to device after creation
+	if device != 'cpu':
+		model = model.to(device)
+	
+	# Convert to tensors
+	parent_tensor = torch.from_numpy(parent_mapped).to(device)
+	child_tensor = torch.from_numpy(child_mapped).to(device)
+	
+	# Training with learning rate scheduling for better convergence
+	optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+	criterion = nn.CrossEntropyLoss()
+	scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+	
+	model.train()
+	n_samples = len(parent_tensor)
+	best_loss = float('inf')
+	
+	for epoch in range(num_epochs):
+		# Shuffle
+		perm = torch.randperm(n_samples, device=device)
+		parent_shuffled = parent_tensor[perm]
+		child_shuffled = child_tensor[perm]
+		
+		epoch_loss = 0.0
+		n_batches = 0
+		
+		# Mini-batch training
+		for i in range(0, n_samples, batch_size):
+			end_idx = min(i + batch_size, n_samples)
+			parent_batch = parent_shuffled[i:end_idx]
+			child_batch = child_shuffled[i:end_idx]
+			
+			optimizer.zero_grad()
+			logits = model.forward([parent_batch])
+			loss = criterion(logits, child_batch)
+			loss.backward()
+			optimizer.step()
+			
+			epoch_loss += loss.item()
+			n_batches += 1
+		
+		avg_loss = epoch_loss / n_batches if n_batches > 0 else epoch_loss
+		scheduler.step(avg_loss)
+		
+		# Early stopping if loss stops improving
+		if avg_loss < best_loss:
+			best_loss = avg_loss
+		elif epoch > 5 and avg_loss >= best_loss * 1.01:  # Loss increased by 1%
+			break
+	
+	# Store mapping for decoding
+	model.parent_map = parent_map
+	model.child_map = child_map
+	model.inverse_child_map = {i: v for v, i in child_map.items()}
+	
+	return model
+
+
+def compute_mlp_model_bits(model: TinyMLP) -> float:
+	"""
+	Compute MDL cost (in bits) for storing the MLP model parameters.
+	
+	Args:
+		model: Trained TinyMLP model
+	
+	Returns:
+		Model cost in bits
+	"""
+	if model is None:
+		return float('inf')
+	
+	# Serialize model parameters
+	params_bytes = serialize_mlp_params(model)
+	
+	# Model cost = 8 bits per byte
+	return len(params_bytes) * 8.0
+
+
+def serialize_mlp_params(model: TinyMLP) -> bytes:
+	"""
+	Serialize MLP model parameters to bytes with quantization to reduce size.
+	
+	Format:
+	[architecture_metadata: JSON][embedding_params...][mlp_params...]
+	
+	Args:
+		model: TinyMLP model
+	
+	Returns:
+		Serialized parameters as bytes
+	"""
+	parts = []
+	
+	# Architecture metadata
+	metadata = {
+		"embedding_dims": model.embedding_dims,
+		"embedding_vocab_sizes": model.embedding_vocab_sizes,
+		"hidden_dims": model.hidden_dims,
+		"num_classes": model.num_classes,
+		"use_gelu": model.use_gelu,
+		"parent_map": {str(k): int(v) for k, v in model.parent_map.items()},
+		"child_map": {str(k): int(v) for k, v in model.child_map.items()},
+	}
+	metadata_json = json.dumps(metadata, separators=(',', ':')).encode('utf-8')
+	parts.append(struct.pack("<I", len(metadata_json)))
+	parts.append(metadata_json)
+	
+	# Quantize parameters to int16 to reduce model size (4x reduction)
+	# Scale factor: use 2^15-1 as max to preserve sign
+	quant_scale = 32767.0
+	
+	# Embedding parameters
+	for emb in model.embeddings:
+		# Get weight matrix [vocab_size, emb_dim]
+		weight = emb.weight.data.cpu().numpy().astype(np.float32)
+		# Quantize to int16
+		weight_max = np.abs(weight).max()
+		if weight_max > 0:
+			weight_quantized = np.clip(weight / weight_max * quant_scale, -quant_scale, quant_scale).astype(np.int16)
+			parts.append(struct.pack("<f", weight_max))  # Store scale factor
+		else:
+			weight_quantized = np.zeros_like(weight, dtype=np.int16)
+			parts.append(struct.pack("<f", 1.0))
+		parts.append(struct.pack("<I", weight_quantized.size))
+		parts.append(weight_quantized.tobytes())
+	
+	# MLP parameters (linear layers)
+	for module in model.mlp:
+		if isinstance(module, nn.Linear):
+			# Weight matrix [out_features, in_features]
+			weight = module.weight.data.cpu().numpy().astype(np.float32)
+			# Quantize to int16
+			weight_max = np.abs(weight).max()
+			if weight_max > 0:
+				weight_quantized = np.clip(weight / weight_max * quant_scale, -quant_scale, quant_scale).astype(np.int16)
+				parts.append(struct.pack("<f", weight_max))  # Store scale factor
+			else:
+				weight_quantized = np.zeros_like(weight, dtype=np.int16)
+				parts.append(struct.pack("<f", 1.0))
+			parts.append(struct.pack("<I", weight_quantized.size))
+			parts.append(weight_quantized.tobytes())
+			
+			# Bias [out_features]
+			bias = module.bias.data.cpu().numpy().astype(np.float32)
+			# Quantize to int16
+			bias_max = np.abs(bias).max()
+			if bias_max > 0:
+				bias_quantized = np.clip(bias / bias_max * quant_scale, -quant_scale, quant_scale).astype(np.int16)
+				parts.append(struct.pack("<f", bias_max))  # Store scale factor
+			else:
+				bias_quantized = np.zeros_like(bias, dtype=np.int16)
+				parts.append(struct.pack("<f", 1.0))
+			parts.append(struct.pack("<I", bias_quantized.size))
+			parts.append(bias_quantized.tobytes())
+	
+	return b"".join(parts)
+
+
+def deserialize_mlp_params(data: bytes) -> Tuple[Dict, TinyMLP]:
+	"""
+	Deserialize MLP model parameters from bytes.
+	
+	Args:
+		data: Serialized parameters
+	
+	Returns:
+		(metadata_dict, model)
+	"""
+	if not TORCH_AVAILABLE:
+		raise ImportError("PyTorch is required for MLP extension")
+	
+	ptr = 0
+	
+	# Read metadata
+	metadata_len = struct.unpack("<I", data[ptr:ptr+4])[0]
+	ptr += 4
+	metadata_json = data[ptr:ptr+metadata_len].decode('utf-8')
+	ptr += metadata_len
+	metadata = json.loads(metadata_json)
+	
+	# Reconstruct parent/child maps
+	parent_map = {int(k): int(v) for k, v in metadata["parent_map"].items()}
+	child_map = {int(k): int(v) for k, v in metadata["child_map"].items()}
+	
+	# Create model on CPU first to avoid MPS device issues
+	model = TinyMLP(
+		embedding_dims=metadata["embedding_dims"],
+		embedding_vocab_sizes=metadata["embedding_vocab_sizes"],
+		hidden_dims=metadata["hidden_dims"],
+		num_classes=metadata["num_classes"],
+		use_gelu=metadata["use_gelu"]
+	)
+	
+	# Determine target device (use CPU for deserialization to avoid MPS issues)
+	# We'll move to device after loading if needed
+	target_device = 'cpu'  # Always load on CPU first
+	
+	# Load embedding parameters (with quantization support)
+	for i, emb in enumerate(model.embeddings):
+		# Read scale factor (for quantized params) or assume float32
+		scale = struct.unpack("<f", data[ptr:ptr+4])[0]
+		ptr += 4
+		param_size = struct.unpack("<I", data[ptr:ptr+4])[0]
+		ptr += 4
+		param_bytes = data[ptr:ptr+param_size*2]  # int16 = 2 bytes
+		ptr += param_size * 2
+		weight_quantized = np.frombuffer(param_bytes, dtype=np.int16).reshape(
+			metadata["embedding_vocab_sizes"][i], metadata["embedding_dims"][i]
+		).copy()
+		# Dequantize
+		weight = (weight_quantized.astype(np.float32) / 32767.0) * scale
+		emb.weight.data = torch.from_numpy(weight).to(target_device)
+	
+	# Load MLP parameters (with quantization support)
+	for module in model.mlp:
+		if isinstance(module, nn.Linear):
+			# Weight
+			scale = struct.unpack("<f", data[ptr:ptr+4])[0]
+			ptr += 4
+			param_size = struct.unpack("<I", data[ptr:ptr+4])[0]
+			ptr += 4
+			param_bytes = data[ptr:ptr+param_size*2]  # int16 = 2 bytes
+			ptr += param_size * 2
+			out_features, in_features = module.weight.shape
+			weight_quantized = np.frombuffer(param_bytes, dtype=np.int16).reshape(out_features, in_features).copy()
+			# Dequantize
+			weight = (weight_quantized.astype(np.float32) / 32767.0) * scale
+			module.weight.data = torch.from_numpy(weight).to(target_device)
+			
+			# Bias
+			scale = struct.unpack("<f", data[ptr:ptr+4])[0]
+			ptr += 4
+			param_size = struct.unpack("<I", data[ptr:ptr+4])[0]
+			ptr += 4
+			param_bytes = data[ptr:ptr+param_size*2]  # int16 = 2 bytes
+			ptr += param_size * 2
+			bias_quantized = np.frombuffer(param_bytes, dtype=np.int16).copy()
+			# Dequantize
+			bias = (bias_quantized.astype(np.float32) / 32767.0) * scale
+			module.bias.data = torch.from_numpy(bias).to(target_device)
+	
+	# Restore maps
+	model.parent_map = parent_map
+	model.child_map = child_map
+	model.inverse_child_map = {i: v for v, i in child_map.items()}
+	
+	# Verify that child_map is complete after deserialization
+	expected_mapped_values = set(range(metadata["num_classes"]))
+	actual_mapped_values = set(child_map.values())
+	if expected_mapped_values != actual_mapped_values:
+		missing = expected_mapped_values - actual_mapped_values
+		raise RuntimeError(
+			f"Child map is incomplete after deserialization: missing mapped values {sorted(list(missing))[:20]}. "
+			f"Expected {metadata['num_classes']} values, got {len(actual_mapped_values)}. "
+			f"This indicates a bug in serialization/deserialization."
+		)
+	
+	return metadata, model
+
+
+def compute_mlp_data_bits(
+	model: TinyMLP,
+	parent_indices: np.ndarray,
+	child_indices: np.ndarray,
+	max_samples: Optional[int] = 100000,
+) -> float:
+	"""
+	Compute data cost (in bits) for encoding child column using MLP probabilities.
+	
+	Uses negative log-likelihood as an approximation of arithmetic coding cost.
+	
+	Args:
+		model: Trained TinyMLP model
+		parent_indices: Parent column indices [n_rows]
+		child_indices: Child column indices [n_rows]
+		max_samples: Maximum samples to use for computation (None = all)
+	
+	Returns:
+		Data cost in bits (negative log-likelihood)
+	"""
+	if model is None:
+		return float('inf')
+	
+	# Sample if needed
+	n_rows = len(parent_indices)
+	if max_samples is not None and n_rows > max_samples:
+		idx = np.random.choice(n_rows, size=max_samples, replace=False)
+		parent_sample = parent_indices[idx]
+		child_sample = child_indices[idx]
+	else:
+		parent_sample = parent_indices
+		child_sample = child_indices
+	
+	# Map parent indices using model's parent_map
+	parent_mapped = np.array([
+		model.parent_map.get(v, 0) for v in parent_sample
+	], dtype=np.int64)
+	
+	# Map child indices using model's child_map
+	child_mapped = np.array([
+		model.child_map.get(v, 0) for v in child_sample
+	], dtype=np.int64)
+	
+	# Convert to tensors
+	device = next(model.parameters()).device
+	parent_tensor = torch.from_numpy(parent_mapped.copy()).long().to(device)  # Make writable and ensure long type
+	
+	# Get probabilities
+	model.eval()
+	with torch.no_grad():
+		logits = model.forward([parent_tensor])
+		probs = torch.softmax(logits, dim=1)
+		probs_np = probs.cpu().numpy()
+	
+	# Compute negative log-likelihood
+	nll = 0.0
+	for i, true_class in enumerate(child_mapped):
+		if true_class < probs_np.shape[1]:
+			p = max(probs_np[i, true_class], 1e-10)  # Avoid log(0)
+			nll -= np.log2(p)
+	
+	# Scale to full dataset size
+	if max_samples is not None and n_rows > max_samples:
+		nll = nll * (n_rows / max_samples)
+	
+	return nll
+
