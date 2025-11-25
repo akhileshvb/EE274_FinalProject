@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark script comparing tabcl with and without MLP extension.
+Benchmark script comparing histogram-based compression with neural autoregressive compression.
 """
 
 import subprocess
@@ -16,7 +16,7 @@ def get_file_size(path: Path) -> int:
 	return path.stat().st_size
 
 
-def run_benchmark(input_file: Path, use_mlp: bool = False, use_mlp_autoregressive: bool = False) -> dict:
+def run_benchmark(input_file: Path, use_neural: bool = False) -> dict:
 	"""Run tabcl compression benchmark."""
 	output_file = input_file.with_suffix('.tabcl')
 	if output_file.exists():
@@ -29,12 +29,8 @@ def run_benchmark(input_file: Path, use_mlp: bool = False, use_mlp_autoregressiv
 		"--input", str(input_file),
 		"--output", str(output_file),
 	]
-	if use_mlp_autoregressive:
-		cmd.append("--use-mlp-autoregressive")
-	elif use_mlp_autoregressive:
-		cmd.append("--use-mlp-autoregressive")
-	elif use_mlp:
-		cmd.append("--use-mlp")
+	if use_neural:
+		cmd.append("--use-neural")
 	
 	# Run compression
 	start_time = time.time()
@@ -141,7 +137,7 @@ def format_size(size_bytes: int) -> str:
 def main():
 	"""Main benchmark function."""
 	if len(sys.argv) < 2:
-		print("Usage: bench_mlp.py <input_file> [input_file2 ...]")
+		print("Usage: bench_neural.py <input_file> [input_file2 ...]")
 		sys.exit(1)
 	
 	input_files = [Path(f) for f in sys.argv[1:]]
@@ -157,76 +153,65 @@ def main():
 		print(f"Benchmarking: {input_file.name}")
 		print(f"{'='*60}\n")
 		
-		# Test without MLP
-		print("1. Testing without MLP (histogram-based)...")
-		result_no_mlp = run_benchmark(input_file, use_mlp=False)
+		# Test histogram-based (default)
+		print("1. Testing histogram-based compression...")
+		result_histogram = run_benchmark(input_file, use_neural=False)
 		
-		if result_no_mlp["success"]:
+		if result_histogram["success"]:
 			print(f"   ✓ Compression successful")
-			print(f"   Size: {format_size(result_no_mlp['compressed_size'])} "
-			      f"(ratio x{result_no_mlp['compression_ratio']:.2f})")
-			print(f"   Time: {result_no_mlp['compress_time']:.3f}s")
-			print(f"   Roundtrip: {'✓' if result_no_mlp['roundtrip_ok'] else '✗'}")
+			print(f"   Size: {format_size(result_histogram['compressed_size'])} "
+			      f"(ratio x{result_histogram['compression_ratio']:.2f})")
+			print(f"   Time: {result_histogram['compress_time']:.3f}s")
+			print(f"   Roundtrip: {'✓' if result_histogram['roundtrip_ok'] else '✗'}")
 		else:
-			print(f"   ✗ Compression failed: {result_no_mlp.get('error', 'Unknown error')}")
+			print(f"   ✗ Compression failed: {result_histogram.get('error', 'Unknown error')}")
 		
-		# Test with MLP (conditional)
-		print("\n2. Testing with MLP extension (conditional)...")
-		result_mlp = run_benchmark(input_file, use_mlp=True)
+		# Test neural compression
+		print("\n2. Testing neural autoregressive compression...")
+		result_neural = run_benchmark(input_file, use_neural=True)
 		
-		# Test with autoregressive MLP
-		print("\n3. Testing with MLP extension (autoregressive)...")
-		result_mlp_ar = run_benchmark(input_file, use_mlp_autoregressive=True)
-		
-		if result_mlp["success"]:
+		if result_neural["success"]:
 			print(f"   ✓ Compression successful")
-			print(f"   Size: {format_size(result_mlp['compressed_size'])} "
-			      f"(ratio x{result_mlp['compression_ratio']:.2f})")
-			print(f"   Time: {result_mlp['compress_time']:.3f}s")
-			print(f"   Roundtrip: {'✓' if result_mlp['roundtrip_ok'] else '✗'}")
+			print(f"   Size: {format_size(result_neural['compressed_size'])} "
+			      f"(ratio x{result_neural['compression_ratio']:.2f})")
+			print(f"   Time: {result_neural['compress_time']:.3f}s")
+			print(f"   Roundtrip: {'✓' if result_neural['roundtrip_ok'] else '✗'}")
 			
 			# Compare
-			if result_no_mlp["success"]:
-				size_diff = result_mlp['compressed_size'] - result_no_mlp['compressed_size']
-				size_diff_pct = (size_diff / result_no_mlp['compressed_size']) * 100
-				time_diff = result_mlp['compress_time'] - result_no_mlp['compress_time']
-				time_diff_pct = (time_diff / result_no_mlp['compress_time']) * 100
+			if result_histogram["success"]:
+				size_diff = result_neural['compressed_size'] - result_histogram['compressed_size']
+				size_diff_pct = (size_diff / result_histogram['compressed_size']) * 100
+				time_diff = result_neural['compress_time'] - result_histogram['compress_time']
+				time_diff_pct = (time_diff / result_histogram['compress_time']) * 100
 				
 				print(f"\n   Comparison:")
 				print(f"   Size change: {size_diff:+.0f} bytes ({size_diff_pct:+.2f}%)")
 				print(f"   Time change: {time_diff:+.3f}s ({time_diff_pct:+.2f}%)")
 		else:
-			print(f"   ✗ Compression failed: {result_mlp.get('error', 'Unknown error')}")
+			print(f"   ✗ Compression failed: {result_neural.get('error', 'Unknown error')}")
 		
 		# Store results
 		results.append({
 			"file": input_file.name,
-			"no_mlp_size": result_no_mlp.get("compressed_size", 0),
-			"no_mlp_ratio": result_no_mlp.get("compression_ratio", 0),
-			"no_mlp_time": result_no_mlp.get("compress_time", 0),
-			"no_mlp_roundtrip": result_no_mlp.get("roundtrip_ok", False),
-			"mlp_size": result_mlp.get("compressed_size", 0),
-			"mlp_ratio": result_mlp.get("compression_ratio", 0),
-			"mlp_time": result_mlp.get("compress_time", 0),
-			"mlp_roundtrip": result_mlp.get("roundtrip_ok", False),
-			"mlp_ar_size": result_mlp_ar.get("compressed_size", 0),
-			"mlp_ar_ratio": result_mlp_ar.get("compression_ratio", 0),
-			"mlp_ar_time": result_mlp_ar.get("compress_time", 0),
-			"mlp_ar_roundtrip": result_mlp_ar.get("roundtrip_ok", False),
-			"size_diff": result_mlp.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
-			"time_diff": result_mlp.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
-			"size_diff_ar": result_mlp_ar.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
-			"time_diff_ar": result_mlp_ar.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
+			"histogram_size": result_histogram.get("compressed_size", 0),
+			"histogram_ratio": result_histogram.get("compression_ratio", 0),
+			"histogram_time": result_histogram.get("compress_time", 0),
+			"histogram_roundtrip": result_histogram.get("roundtrip_ok", False),
+			"neural_size": result_neural.get("compressed_size", 0),
+			"neural_ratio": result_neural.get("compression_ratio", 0),
+			"neural_time": result_neural.get("compress_time", 0),
+			"neural_roundtrip": result_neural.get("roundtrip_ok", False),
+			"size_diff": result_neural.get("compressed_size", 0) - result_histogram.get("compressed_size", 0),
+			"time_diff": result_neural.get("compress_time", 0) - result_histogram.get("compress_time", 0),
 		})
 	
 	# Write results to CSV
-	output_csv = Path("mlp_benchmark_results.csv")
+	output_csv = Path("neural_benchmark_results.csv")
 	with open(output_csv, 'w', newline='') as f:
 		writer = csv.DictWriter(f, fieldnames=[
-			"file", "no_mlp_size", "no_mlp_ratio", "no_mlp_time", "no_mlp_roundtrip",
-			"mlp_size", "mlp_ratio", "mlp_time", "mlp_roundtrip",
-			"mlp_ar_size", "mlp_ar_ratio", "mlp_ar_time", "mlp_ar_roundtrip",
-			"size_diff", "time_diff", "size_diff_ar", "time_diff_ar",
+			"file", "histogram_size", "histogram_ratio", "histogram_time", "histogram_roundtrip",
+			"neural_size", "neural_ratio", "neural_time", "neural_roundtrip",
+			"size_diff", "time_diff",
 		])
 		writer.writeheader()
 		writer.writerows(results)

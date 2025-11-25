@@ -896,7 +896,7 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 	output_path.write_text(df.to_csv(index=False))
 
 
-def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False) -> None:
+def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False) -> None:
 	import time
 	profiler = {}  # Track time spent in each stage
 	total_start = time.time()
@@ -1028,8 +1028,15 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	
 	# Compute all edge pairs (skip high-cardinality columns)
 	stage_start = time.time()
-	all_pairs = [(i, j) for i in range(n_cols) for j in range(i + 1, n_cols) if i not in skip_high_card and j not in skip_high_card]
-	max_workers = min(len(all_pairs), int(os.cpu_count() or 4), 16)
+	all_pairs = [
+		(i, j)
+		for i in range(n_cols)
+		for j in range(i + 1, n_cols)
+		if i not in skip_high_card and j not in skip_high_card
+	]
+	# Guard against degenerate cases where no candidate edges remain (e.g. single-column or all filtered)
+	# ThreadPoolExecutor requires max_workers >= 1.
+	max_workers = max(1, min(len(all_pairs) or 1, int(os.cpu_count() or 4), 16))
 	with ThreadPoolExecutor(max_workers=max_workers) as executor:
 		all_fast_edges = list(executor.map(compute_fast_weight, all_pairs))
 	
@@ -1092,9 +1099,12 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		return (u, v, w)
 	
 	stage_start = time.time()
-	max_workers = min(len(top_candidates), int(os.cpu_count() or 4), 8)
-	with ThreadPoolExecutor(max_workers=max_workers) as executor:
-		refined_edges = list(executor.map(recompute_weight, top_candidates))
+	if top_candidates:
+		max_workers = max(1, min(len(top_candidates), int(os.cpu_count() or 4), 8))
+		with ThreadPoolExecutor(max_workers=max_workers) as executor:
+			refined_edges = list(executor.map(recompute_weight, top_candidates))
+	else:
+		refined_edges = []
 	
 	# Filter negative weights
 	refined_edges = [(u, v, w) for u, v, w in refined_edges if w > 0.0]
@@ -1147,13 +1157,28 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	# Encode columns
 	frames: List[bytes]
 	mlp_models: List[Optional[bytes]]
-	frames, mlp_models = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1, use_mlp=use_mlp)
+	neural_metadata: Optional[Dict[str, Any]] = None
+	
+	if use_neural:
+		from .neural_compression import encode_columns_neural
+		# Neural compression: uses same forest structure as histogram approach
+		frames, mlp_models, neural_metadata = encode_columns_neural(
+			indices, parents, dicts, embedding_dim=8, hidden_dims=[32, 32], num_epochs=15
+		)
+	else:
+		frames, mlp_models = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1, use_mlp=use_mlp)
 	
 	profiler["encode_columns"] = time.time() - stage_start
 	
 	# Update model with MLP models and re-serialize
-	if use_mlp:
+	if use_mlp or use_neural:
 		model.mlp_models = mlp_models
+		model_bytes = model.to_bytes()
+	
+	# Store neural metadata in model if using neural compression
+	if use_neural and neural_metadata:
+		import json
+		model.rare_meta.append(f"_neural_metadata:{json.dumps(neural_metadata)}")
 		model_bytes = model.to_bytes()
 
 	# Compress frames with an additional layer for better compression
@@ -1308,7 +1333,22 @@ def decompress_file(input_path: str, output_path: str) -> None:
 		raise RuntimeError("Could not determine row count")
 
 	# Decode columns
-	indices = decode_columns_with_parents(frames, model.parents, n_rows, mlp_models=model.mlp_models)
+	# Check if neural compression was used
+	use_neural = False
+	neural_metadata = None
+	for meta in model.rare_meta:
+		if meta and meta.startswith("_neural_metadata:"):
+			import json
+			use_neural = True
+			neural_metadata_str = meta.split(":", 1)[1]
+			neural_metadata = json.loads(neural_metadata_str)
+			break
+	
+	if use_neural and neural_metadata:
+		from .neural_compression import decode_columns_neural
+		indices = decode_columns_neural(frames, model.mlp_models or [], neural_metadata, n_rows)
+	else:
+		indices = decode_columns_with_parents(frames, model.parents, n_rows, mlp_models=model.mlp_models)
 
 	rec_cols: Dict[str, Any] = {}
 	EMPTY_STRING = ""
@@ -1527,6 +1567,7 @@ def main() -> None:
 	pc.add_argument("--mi-seed", type=int, default=0, help="Random seed for MI sampling")
 	pc.add_argument("--workers", type=int, default=None, help="Parallel workers for column/bucket compression")
 	pc.add_argument("--use-mlp", action="store_true", help="Use tiny MLP models for conditional compression (experimental)")
+	pc.add_argument("--use-neural", action="store_true", help="Use neural autoregressive compression (fully ML-based)")
 
 	pdcp = sub.add_parser("decompress", help="Decompress to CSV")
 	pdcp.add_argument("--input", required=True)
@@ -1537,7 +1578,7 @@ def main() -> None:
 	if args.cmd == "prepare":
 		_prepare_raw_to_csv(Path(args.input), Path(args.output), header=args.has_header)
 	elif args.cmd == "compress":
-		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp)
+		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural)
 	elif args.cmd == "decompress":
 		decompress_file(args.input, args.output)
 	else:

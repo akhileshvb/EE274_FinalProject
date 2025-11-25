@@ -119,7 +119,7 @@ class TinyMLP(nn.Module):
 
 def train_tiny_mlp(
 	child_indices: np.ndarray,
-	parent_indices: np.ndarray,
+	parent_indices: Optional[np.ndarray] = None,  # Single parent (for conditional mode)
 	embedding_dim: int = 16,
 	hidden_dims: List[int] = [64],
 	num_epochs: int = 15,  # Increased for better learning
@@ -129,20 +129,31 @@ def train_tiny_mlp(
 	device: Optional[str] = None,
 	all_unique_children: Optional[np.ndarray] = None,  # All unique child values from full dataset
 	all_unique_parents: Optional[np.ndarray] = None,  # All unique parent values from full dataset
+	# Autoregressive mode parameters:
+	autoregressive_parents: Optional[List[np.ndarray]] = None,  # Multiple parent columns
+	autoregressive_vocab_sizes: Optional[List[int]] = None,  # Vocab sizes for each parent
 ) -> Optional[TinyMLP]:
 	"""
-	Train a tiny MLP to predict child column from parent column.
+	Train a tiny MLP to predict child column from parent column(s).
+	
+	Supports two modes:
+	1. Conditional mode: single parent column (parent_indices provided)
+	2. Autoregressive mode: multiple parent columns (autoregressive_parents provided)
 	
 	Args:
 		child_indices: Array of child column class indices [n_rows]
-		parent_indices: Array of parent column class indices [n_rows]
-		embedding_dim: Dimension for parent embedding
+		parent_indices: Array of parent column class indices [n_rows] (conditional mode)
+		embedding_dim: Dimension for each parent embedding
 		hidden_dims: Hidden layer dimensions
 		num_epochs: Number of training epochs
 		batch_size: Batch size for training
 		learning_rate: Learning rate
 		max_samples: Maximum number of samples to use for training (None = all)
 		device: Device to use ('cpu', 'mps', 'cuda', or None for auto)
+		all_unique_children: All unique child values from full dataset
+		all_unique_parents: All unique parent values from full dataset (conditional mode)
+		autoregressive_parents: List of parent column arrays (autoregressive mode)
+		autoregressive_vocab_sizes: Vocab sizes for each parent in autoregressive mode
 	
 	Returns:
 		Trained TinyMLP model, or None if training fails or is skipped
@@ -154,125 +165,186 @@ def train_tiny_mlp(
 		# Too small to train
 		return None
 	
-	# Sample if needed
-	n_rows = len(child_indices)
-	if max_samples is not None and n_rows > max_samples:
-		idx = np.random.choice(n_rows, size=max_samples, replace=False)
-		child_sample = child_indices[idx]
-		parent_sample = parent_indices[idx]
-	else:
+	# Determine mode
+	is_autoregressive = autoregressive_parents is not None and len(autoregressive_parents) > 0
+	
+	if is_autoregressive:
+		# Autoregressive mode: multiple parent columns
+		n_rows = len(child_indices)
 		child_sample = child_indices
-		parent_sample = parent_indices
-	
-	# Get vocabulary sizes
-	# Use all unique values from full dataset if provided, otherwise use sample
-	if all_unique_parents is not None:
-		unique_parents_list = all_unique_parents
-	else:
-		unique_parents_list = np.unique(parent_sample)
-	
-	if all_unique_children is not None:
-		unique_children_list = all_unique_children
-	else:
-		unique_children_list = np.unique(child_sample)
-	
-	# Filter out -1 (sentinel value) from unique lists
-	# -1 is used as a sentinel in the codebase (e.g., for missing parents)
-	# and should not be included in the MLP model's vocabulary
-	unique_children_list = unique_children_list[unique_children_list != -1]
-	unique_parents_list = unique_parents_list[unique_parents_list != -1]
-	
-	unique_parents = len(unique_parents_list)
-	unique_children = len(unique_children_list)
-	
-	# Skip if too many classes (would require huge output layer)
-	if unique_children > 10000:
-		return None
-	
-	# Map to 0-indexed contiguous integers
-	# Use all unique values to ensure mapping covers full dataset
-	# IMPORTANT: -1 is a sentinel value and should NOT be in the map
-	# If we encounter -1 during encoding/decoding, we'll handle it specially
-	parent_map = {v: i for i, v in enumerate(unique_parents_list) if v != -1}
-	child_map = {v: i for i, v in enumerate(unique_children_list) if v != -1}
-	
-	# Verify -1 is not in the maps
-	if -1 in parent_map or -1 in child_map:
-		raise RuntimeError("ERROR: -1 (sentinel value) found in parent_map or child_map! This should not happen.")
-	
-	# Verify that child_map is complete (all values in [0, len(unique_children_list)-1] should be present)
-	# This is a sanity check - if this fails, there's a bug
-	expected_mapped_values = set(range(len(unique_children_list)))
-	actual_mapped_values = set(child_map.values())
-	if expected_mapped_values != actual_mapped_values:
-		missing = expected_mapped_values - actual_mapped_values
-		raise RuntimeError(
-			f"Child map is incomplete during training: missing mapped values {sorted(list(missing))[:20]}. "
-			f"Expected {len(unique_children_list)} values, got {len(actual_mapped_values)}"
+		
+		# Get unique children
+		if all_unique_children is not None:
+			unique_children_list = all_unique_children
+		else:
+			unique_children_list = np.unique(child_sample)
+		unique_children_list = unique_children_list[unique_children_list != -1]
+		unique_children = len(unique_children_list)
+		
+		if unique_children > 10000:
+			return None
+		
+		# Build child map
+		child_map = {v: i for i, v in enumerate(unique_children_list) if v != -1}
+		
+		# Build parent maps for each parent column
+		parent_maps = []
+		embedding_vocab_sizes = []
+		parent_mapped_list = []
+		
+		for i, prev_col in enumerate(autoregressive_parents):
+			if autoregressive_vocab_sizes and i < len(autoregressive_vocab_sizes):
+				vocab_size = autoregressive_vocab_sizes[i]
+				unique_parents_list = np.unique(prev_col)
+				unique_parents_list = unique_parents_list[unique_parents_list != -1]
+				# Use provided vocab size, but ensure we have enough unique values
+				if len(unique_parents_list) > vocab_size:
+					# Take most frequent values
+					from collections import Counter
+					counts = Counter(prev_col[prev_col != -1])
+					most_common = [val for val, _ in counts.most_common(vocab_size)]
+					unique_parents_list = np.array(most_common)
+			else:
+				unique_parents_list = np.unique(prev_col)
+				unique_parents_list = unique_parents_list[unique_parents_list != -1]
+			
+			parent_map = {v: j for j, v in enumerate(unique_parents_list) if v != -1}
+			parent_maps.append(parent_map)
+			embedding_vocab_sizes.append(len(unique_parents_list))
+			
+			# Map parent column
+			parent_mapped = np.array([
+				parent_map.get(v, 0) if v != -1 else 0 for v in prev_col
+			], dtype=np.int64)
+			parent_mapped_list.append(parent_mapped)
+		
+		# Map child
+		child_mapped = np.array([
+			child_map.get(v, -1) if v != -1 else -1 for v in child_sample
+		], dtype=np.int64)
+		
+		# Filter valid rows (all parents and child must be valid)
+		valid_mask = (child_mapped != -1)
+		for parent_mapped in parent_mapped_list:
+			valid_mask = valid_mask & (parent_mapped >= 0)
+		
+		if not np.any(valid_mask) or np.sum(valid_mask) < 100:
+			return None
+		
+		child_mapped = child_mapped[valid_mask]
+		parent_mapped_list = [pm[valid_mask] for pm in parent_mapped_list]
+		
+		# Create model
+		if device is None:
+			device = 'cpu'
+		
+		model = TinyMLP(
+			embedding_dims=[embedding_dim] * len(autoregressive_parents),
+			embedding_vocab_sizes=embedding_vocab_sizes,
+			hidden_dims=hidden_dims,
+			num_classes=unique_children,
+			use_gelu=True
 		)
+		if device != 'cpu':
+			model = model.to(device)
+		
+		# Store parent maps in model for decoding
+		for i, pm in enumerate(parent_maps):
+			setattr(model, f'parent_map_{i}', pm)
+		model.parent_map = parent_maps[0] if parent_maps else {}
+		model.child_map = child_map
+		
+		# Convert to tensors
+		parent_tensors = [torch.from_numpy(pm).long().to(device) for pm in parent_mapped_list]
+		child_tensor = torch.from_numpy(child_mapped).long().to(device)
+		
+	else:
+		# Conditional mode: single parent column
+		if parent_indices is None:
+			return None
+		
+		# Sample if needed
+		n_rows = len(child_indices)
+		if max_samples is not None and n_rows > max_samples:
+			idx = np.random.choice(n_rows, size=max_samples, replace=False)
+			child_sample = child_indices[idx]
+			parent_sample = parent_indices[idx]
+		else:
+			child_sample = child_indices
+			parent_sample = parent_indices
+		
+		# Get vocabulary sizes
+		if all_unique_parents is not None:
+			unique_parents_list = all_unique_parents
+		else:
+			unique_parents_list = np.unique(parent_sample)
+		
+		if all_unique_children is not None:
+			unique_children_list = all_unique_children
+		else:
+			unique_children_list = np.unique(child_sample)
+		
+		unique_children_list = unique_children_list[unique_children_list != -1]
+		unique_parents_list = unique_parents_list[unique_parents_list != -1]
+		
+		unique_parents = len(unique_parents_list)
+		unique_children = len(unique_children_list)
+		
+		if unique_children > 10000:
+			return None
+		
+		parent_map = {v: i for i, v in enumerate(unique_parents_list) if v != -1}
+		child_map = {v: i for i, v in enumerate(unique_children_list) if v != -1}
+		
+		if -1 in parent_map or -1 in child_map:
+			raise RuntimeError("ERROR: -1 (sentinel value) found in parent_map or child_map!")
+		
+		parent_mapped = np.array([
+			parent_map.get(v, -1) if v != -1 else -1 for v in parent_sample
+		], dtype=np.int64)
+		child_mapped = np.array([
+			child_map.get(v, -1) if v != -1 else -1 for v in child_sample
+		], dtype=np.int64)
+		
+		valid_mask = (parent_mapped != -1) & (child_mapped != -1)
+		if not np.any(valid_mask) or np.sum(valid_mask) < 100:
+			return None
+		
+		parent_mapped = parent_mapped[valid_mask]
+		child_mapped = child_mapped[valid_mask]
+		
+		if device is None:
+			device = 'cpu'
+		
+		model = TinyMLP(
+			embedding_dims=[embedding_dim],
+			embedding_vocab_sizes=[unique_parents],
+			hidden_dims=hidden_dims,
+			num_classes=unique_children,
+			use_gelu=True
+		)
+		if device != 'cpu':
+			model = model.to(device)
+		
+		model.parent_map = parent_map
+		model.child_map = child_map
+		
+		parent_tensors = [torch.from_numpy(parent_mapped).long().to(device)]
+		child_tensor = torch.from_numpy(child_mapped).long().to(device)
 	
-	# Map parent and child samples, handling -1 (sentinel) values
-	# -1 should not be in the maps, so we need to filter it out or handle it specially
-	parent_mapped = np.array([
-		parent_map.get(v, -1) if v != -1 else -1 for v in parent_sample
-	], dtype=np.int64)
-	child_mapped = np.array([
-		child_map.get(v, -1) if v != -1 else -1 for v in child_sample
-	], dtype=np.int64)
-	
-	# Filter out rows where parent or child is -1 (sentinel value)
-	valid_mask = (parent_mapped != -1) & (child_mapped != -1)
-	if not np.any(valid_mask):
-		# All rows have sentinel values - can't train
-		return None
-	
-	parent_mapped = parent_mapped[valid_mask]
-	child_mapped = child_mapped[valid_mask]
-	
-	if len(parent_mapped) < 100:
-		# Too few valid rows after filtering
-		return None
-	
-	# Determine device - use CPU for stability (MPS has issues with some operations)
-	# Users can override by passing device explicitly
-	if device is None:
-		device = 'cpu'  # Default to CPU for stability
-		# Uncomment below to use MPS/CUDA if available (but may have issues)
-		# if torch.backends.mps.is_available():
-		# 	device = 'mps'
-		# elif torch.cuda.is_available():
-		# 	device = 'cuda'
-	
-	# Create model on CPU first, then move to device
-	# This avoids MPS device issues during initialization
-	model = TinyMLP(
-		embedding_dims=[embedding_dim],
-		embedding_vocab_sizes=[unique_parents],
-		hidden_dims=hidden_dims,
-		num_classes=unique_children,
-		use_gelu=True
-	)
-	# Move to device after creation
-	if device != 'cpu':
-		model = model.to(device)
-	
-	# Convert to tensors
-	parent_tensor = torch.from_numpy(parent_mapped).to(device)
-	child_tensor = torch.from_numpy(child_mapped).to(device)
-	
-	# Training with learning rate scheduling for better convergence
+	# Training
 	optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 	criterion = nn.CrossEntropyLoss()
 	scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 	
 	model.train()
-	n_samples = len(parent_tensor)
+	n_samples = len(child_tensor)
 	best_loss = float('inf')
 	
 	for epoch in range(num_epochs):
 		# Shuffle
 		perm = torch.randperm(n_samples, device=device)
-		parent_shuffled = parent_tensor[perm]
+		parent_tensors_shuffled = [pt[perm] for pt in parent_tensors]
 		child_shuffled = child_tensor[perm]
 		
 		epoch_loss = 0.0
@@ -281,11 +353,11 @@ def train_tiny_mlp(
 		# Mini-batch training
 		for i in range(0, n_samples, batch_size):
 			end_idx = min(i + batch_size, n_samples)
-			parent_batch = parent_shuffled[i:end_idx]
+			parent_batches = [pt[i:end_idx] for pt in parent_tensors_shuffled]
 			child_batch = child_shuffled[i:end_idx]
 			
 			optimizer.zero_grad()
-			logits = model.forward([parent_batch])
+			logits = model.forward(parent_batches)
 			loss = criterion(logits, child_batch)
 			loss.backward()
 			optimizer.step()

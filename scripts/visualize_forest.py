@@ -193,18 +193,18 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         
         # Size based on degree (hubs are larger) and connection status
         # Make nodes large enough to fit the font size comfortably
-        # Font sizes are: 16-20 for nodes, so nodes should be at least 800-1200
+        # Font sizes are: 20-28 for nodes, so nodes should be at least 2000-3000
         if n_nodes > 30:
-            base_size = 1200  # Large enough for font size 16
+            base_size = 2500  # Large enough for font size 20
         elif n_nodes > 15:
-            base_size = 1400  # Large enough for font size 18
+            base_size = 2800  # Large enough for font size 24
         else:
-            base_size = 1600  # Large enough for font size 20
+            base_size = 3200  # Large enough for font size 28
         
         degree = degrees.get(i, 0)
         if highlight_connected and is_connected:
             # Connected nodes are larger, and scale with degree
-            size = base_size + degree * 200
+            size = base_size + degree * 300
         else:
             size = base_size * 0.9  # Isolated nodes still need to fit text
         node_sizes.append(size)
@@ -241,7 +241,7 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
     
     # Draw nodes after edges (so nodes are on top)
     nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, 
-                          node_size=node_sizes, alpha=0.9, edgecolors="black", linewidths=2)
+                          node_size=node_sizes, alpha=0.9, edgecolors="black", linewidths=3)
     
     # Draw edge labels after nodes but with offset to avoid overlap
     if show_weights and G.edges():
@@ -251,12 +251,12 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
             # Add weight labels on edges - only for smaller graphs or important edges
             if len(edges) <= 15:  # Only show weights if not too many edges
                 edge_labels = {(u, v): f"{w:.1f}" for (u, v), w in zip(edges, weights)}
-                edge_font_size = 18 if n_nodes <= 15 else 16
+                edge_font_size = 24 if n_nodes <= 15 else 22
                 # Use networkx edge labels - it will position them correctly on edges
                 nx.draw_networkx_edge_labels(G, pos, edge_labels, ax=ax, 
                                             font_size=edge_font_size,
                                             bbox=dict(boxstyle="round,pad=0.5", facecolor="white", 
-                                                     edgecolor="darkgreen", linewidth=1.5, alpha=0.95),
+                                                     edgecolor="darkgreen", linewidth=2.0, alpha=0.95),
                                             rotate=False,  # Don't rotate labels
                                             )
             elif len(edges) <= 50:
@@ -265,12 +265,12 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                 top_n = max(5, len(edges) // 10)
                 top_edges = sorted_edges[:top_n]
                 edge_labels = {(u, v): f"{w:.1f}" for (u, v), w in top_edges}
-                edge_font_size = 16 if n_nodes <= 30 else 14
+                edge_font_size = 22 if n_nodes <= 30 else 20
                 # Use networkx edge labels - it will position them correctly on edges
                 nx.draw_networkx_edge_labels(G, pos, edge_labels, ax=ax, 
                                             font_size=edge_font_size,
                                             bbox=dict(boxstyle="round,pad=0.5", facecolor="white", 
-                                                     edgecolor="darkgreen", linewidth=1.5, alpha=0.95),
+                                                     edgecolor="darkgreen", linewidth=2.0, alpha=0.95),
                                             rotate=False,  # Don't rotate labels
                                             )
     else:
@@ -287,11 +287,11 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         
         # Determine font size based on graph size
         if n_nodes > 30:
-            base_font_size = 16
+            base_font_size = 22
         elif n_nodes > 15:
-            base_font_size = 18
+            base_font_size = 26
         else:
-            base_font_size = 20
+            base_font_size = 28
         
         # Draw all labels with larger font
         nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=base_font_size, font_weight="bold")
@@ -327,7 +327,7 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
     print()
     
     # Simple title
-    ax.set_title("Forest Structure", fontsize=24, fontweight="bold", pad=20)
+    ax.set_title("Forest Structure", fontsize=32, fontweight="bold", pad=25)
     ax.axis("off")
     
     # Add legend
@@ -348,9 +348,10 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                                     label=f'Child (isolated) [{len(child_isolated)}]'))
     
     if legend_elements:
-        # Place legend closer to the graph (inside the plot area, top right)
-        ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98), 
-                 frameon=True, fancybox=True, shadow=True, fontsize=18)
+        # Place legend outside the plot area to avoid covering nodes
+        # Use upper left anchor but position it outside on the right side
+        ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1.0), 
+                 frameon=True, fancybox=True, shadow=True, fontsize=24)
     
     plt.tight_layout()
     
