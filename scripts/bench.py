@@ -9,11 +9,17 @@ from pathlib import Path
 
 
 def human(n: int) -> str:
-	for unit in ["B", "KB", "MB", "GB", "TB"]:
-		if n < 1024:
-			return f"{n:.1f} {unit}"
-		n //= 1024
-	return f"{n} PB"
+	"""Convert bytes to human-readable format with proper precision."""
+	if n < 1024:
+		return f"{n:.1f} B"
+	elif n < 1024 * 1024:
+		return f"{n / 1024:.1f} KB"
+	elif n < 1024 * 1024 * 1024:
+		return f"{n / (1024 * 1024):.1f} MB"
+	elif n < 1024 * 1024 * 1024 * 1024:
+		return f"{n / (1024 * 1024 * 1024):.1f} GB"
+	else:
+		return f"{n / (1024 * 1024 * 1024 * 1024):.1f} TB"
 
 
 def run(cmd: list[str]) -> float:
@@ -86,6 +92,28 @@ def main() -> None:
 		tabcl_cmd.extend(["--workers", str(workers)])
 	tabcl_time = run(tabcl_cmd)
 	tabcl_size = tabcl_out.stat().st_size
+	
+	# tabcl with line graph baseline (sequential chain instead of learned tree)
+	tabcl_line_out = outdir / (inp.name + ".tabcl_line")
+	if tabcl_line_out.exists():
+		tabcl_line_out.unlink()
+	tabcl_line_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_line_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold), "--use-line-graph"]
+	if mi_sample:
+		tabcl_line_cmd.extend(["--mi-sample", str(mi_sample)])
+	if workers and workers > 0:
+		tabcl_line_cmd.extend(["--workers", str(workers)])
+	tabcl_line_time = run(tabcl_line_cmd)
+	tabcl_line_size = tabcl_line_out.stat().st_size
+	
+	# tabcl + zstd (compress tabcl output with zstd)
+	tabcl_zstd_out = outdir / (inp.name + ".tabcl.zst")
+	tabcl_zstd_time = None
+	tabcl_zstd_size = None
+	if shutil.which("zstd") and tabcl_out.exists():
+		cmd = ["zstd", "-q", f"-{args.zstd_level}", "-f", str(tabcl_out), "-o", str(tabcl_zstd_out)]
+		tabcl_zstd_time = run(cmd)
+		tabcl_zstd_size = tabcl_zstd_out.stat().st_size
+	
 	# Verify roundtrip (but don't time decompression)
 	tmp_path = None
 	try:
@@ -204,6 +232,39 @@ def main() -> None:
 		except Exception as e:
 			print(f"Warning: Columnar gzip failed: {e}", file=sys.stderr)
 			colgzip_size = None
+	
+	# Columnar zstd (compress each column separately)
+	colzstd_size = None
+	colzstd_time = None
+	if shutil.which("zstd"):
+		try:
+			import pandas as pd
+			# Normalize delimiter: convert "\\t" to '\t' (tab character)
+			delimiter = args.delimiter
+			if delimiter == '\\t':
+				delimiter = '\t'
+			elif delimiter == '\\n':
+				delimiter = '\n'
+			# Use engine='python' and on_bad_lines='skip' to handle malformed lines
+			import warnings
+			warnings.filterwarnings('ignore', category=pd.errors.ParserWarning)
+			df = pd.read_csv(inp, delimiter=delimiter, header=None, engine='python', on_bad_lines='skip')
+			start = time.perf_counter()
+			col_sizes = []
+			with tempfile.TemporaryDirectory() as tmpdir:
+				for col_idx, col_name in enumerate(df.columns):
+					col_file = Path(tmpdir) / f"col_{col_idx}.txt"
+					col_file.write_text("\n".join(str(v) for v in df[col_name].astype(str)))
+					col_zst = Path(tmpdir) / f"col_{col_idx}.txt.zst"
+					subprocess.run(["zstd", "-q", f"-{args.zstd_level}", "-f", str(col_file), "-o", str(col_zst)], 
+					              check=True, capture_output=True)
+					if col_zst.exists():
+						col_sizes.append(col_zst.stat().st_size)
+			colzstd_time = time.perf_counter() - start
+			colzstd_size = sum(col_sizes)
+		except Exception as e:
+			print(f"Warning: Columnar zstd failed: {e}", file=sys.stderr)
+			colzstd_size = None
 
 	def ratio(size: int | None) -> str:
 		if size is None:
@@ -216,6 +277,13 @@ def main() -> None:
 	print("tabcl:")
 	print(f"  size:  {human(tabcl_size)}  (ratio {ratio(tabcl_size)})")
 	print(f"  time:  {tabcl_time:.3f}s")
+	print("tabcl (line graph):")
+	print(f"  size:  {human(tabcl_line_size)}  (ratio {ratio(tabcl_line_size)})")
+	print(f"  time:  {tabcl_line_time:.3f}s")
+	if tabcl_zstd_size is not None:
+		print("tabcl + zstd:")
+		print(f"  size:  {human(tabcl_zstd_size)}  (ratio {ratio(tabcl_zstd_size)})")
+		print(f"  time:  {tabcl_time + tabcl_zstd_time:.3f}s (tabcl: {tabcl_time:.3f}s + zstd: {tabcl_zstd_time:.3f}s, level {args.zstd_level})")
 	if gzip_size is not None:
 		print("gzip:")
 		print(f"  size:  {human(gzip_size)}  (ratio {ratio(gzip_size)})")
@@ -240,6 +308,12 @@ def main() -> None:
 		print(f"  time:  {colgzip_time:.3f}s")
 	else:
 		print("columnar gzip: not available")
+	if colzstd_size is not None:
+		print("columnar zstd:")
+		print(f"  size:  {human(colzstd_size)}  (ratio {ratio(colzstd_size)})")
+		print(f"  time:  {colzstd_time:.3f}s (level {args.zstd_level})")
+	else:
+		print("columnar zstd: not available")
 
 if __name__ == "__main__":
 	main()

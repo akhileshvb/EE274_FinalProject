@@ -35,10 +35,13 @@ class Model:
 		for d in self.dicts:
 			if isinstance(d, tuple):
 				# Special numeric format - store as tuple marker + data
-				# Check if it's a timestamp format
+				# Check if it's a timestamp or sparse format
 				if len(d) == 2 and d[0] == "_timestamp":
 					# Timestamp format: ("_timestamp", sentinel_value)
 					dicts_encoded.append(("_timestamp", d[1]))
+				elif len(d) == 2 and d[0] == "_sparse":
+					# Sparse format: ("_sparse", (sentinel_value, scale))
+					dicts_encoded.append(("_sparse", list(d[1]) if isinstance(d[1], tuple) else d[1]))
 				else:
 					# Other special formats (e.g., ("_scale", 10))
 					dicts_encoded.append(("_tuple", list(d)))
@@ -123,8 +126,13 @@ class Model:
 		if mlp_models_encoded is not None:
 			obj["mlp_models"] = mlp_models_encoded
 		json_bytes = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-		# Compress the model metadata to reduce overhead
-		return generic_bytes_compress(json_bytes)
+		# Compress the model metadata aggressively to reduce overhead
+		# Try compressing even if it's relatively small - model metadata often compresses well
+		compressed = generic_bytes_compress(json_bytes, min_size=30)
+		# Always use compression if it helps, even for small models
+		if len(compressed) < len(json_bytes):
+			return compressed
+		return json_bytes
 
 	@staticmethod
 	def from_bytes(b: bytes) -> "Model":
@@ -545,7 +553,69 @@ def _tokenize_columns(df: pd.DataFrame, rare_threshold: int) -> Tuple[List[np.nd
 							continue
 				
 				if best_int_array is not None:
-					# Store scaled integers with scale factor in metadata
+					# Check for sentinel values (very common values that likely represent missing data)
+					# This is critical for sparse datasets like jester where 99/99.0 is used as sentinel
+					# If a single value appears in >30% of rows, treat it as a sentinel and use sparse storage
+					unique_vals, counts = np.unique(best_int_array, return_counts=True)
+					max_count_idx = np.argmax(counts)
+					max_count = counts[max_count_idx]
+					sentinel_value = unique_vals[max_count_idx]
+					sentinel_ratio = max_count / len(best_int_array)
+					
+					# Use sparse storage if sentinel appears in >30% of rows and saves space
+					# Sparse storage: store only non-sentinel values with their indices
+					if sentinel_ratio > 0.30:
+						# Check if sparse storage would be beneficial
+						non_sentinel_mask = best_int_array != sentinel_value
+						non_sentinel_count = np.sum(non_sentinel_mask)
+						
+						# Sparse format: [sentinel_value: int64][n_non_sentinel: varint][indices: varint...][values: compressed]
+						# Estimate size: 8 bytes (sentinel) + varint(n_non_sentinel) + varint(indices) + compressed(values)
+						# vs dense: compressed(all_values)
+						# Use sparse if it saves at least 10% space
+						non_sentinel_values = best_int_array[non_sentinel_mask]
+						non_sentinel_indices = np.where(non_sentinel_mask)[0]
+						
+						# Estimate sparse size: sentinel (8) + count varint (~1-4) + indices varints + values compressed
+						from .conditional import _encode_varint
+						indices_varint_size = sum(len(_encode_varint(int(idx), signed=False)) for idx in non_sentinel_indices)
+						# Estimate compressed values size (will be computed exactly)
+						from .codec import compress_numeric_array_fast
+						try:
+							sparse_values_compressed = compress_numeric_array_fast(non_sentinel_values, use_ace=False, prefer_delta=False)
+							sparse_estimated_size = 8 + len(_encode_varint(non_sentinel_count, signed=False)) + indices_varint_size + len(sparse_values_compressed)
+							
+							# Compare with dense storage
+							dense_compressed = compress_numeric_array_fast(best_int_array, use_ace=False, prefer_delta=False)
+							dense_size = len(dense_compressed)
+							
+							# Use sparse if it saves at least 5% space (be aggressive for high sparsity)
+							if sparse_estimated_size < dense_size * 0.95 or sentinel_ratio > 0.50:
+								# Store sparse format: sentinel value + sparse indices + sparse values
+								import struct
+								sparse_parts = []
+								sparse_parts.append(struct.pack("<q", int(sentinel_value)))  # 8 bytes for sentinel
+								sparse_parts.append(_encode_varint(non_sentinel_count, signed=False))  # Count
+								# Delta-encode indices for better compression
+								prev_idx = -1
+								for idx in non_sentinel_indices:
+									delta = idx - prev_idx
+									sparse_parts.append(_encode_varint(delta, signed=False))
+									prev_idx = idx
+								sparse_parts.append(sparse_values_compressed)
+								sparse_data = b"".join(sparse_parts)
+								
+								indices_list.append(sparse_data)  # Store as bytes (not array)
+								# Use special format marker: ("_sparse", sentinel_value, scale)
+								dicts.append(("_sparse", (sentinel_value, best_scale)))
+								rare_blobs.append(b"")  # No rare values for sparse numeric
+								is_numeric_list.append(True)
+								continue
+						except Exception:
+							# If sparse compression fails, fall through to dense storage
+							pass
+					
+					# Store scaled integers with scale factor in metadata (dense format)
 					# Scale can be 1 (pure integers) or >1 (scaled floats)
 					indices_list.append(best_int_array)
 					# Store scale info: use a tuple ("_scale", scale) to indicate scaled float
@@ -896,7 +966,7 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 	output_path.write_text(df.to_csv(index=False))
 
 
-def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False) -> None:
+def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False, use_line_graph: bool = False) -> None:
 	import time
 	profiler = {}  # Track time spent in each stage
 	total_start = time.time()
@@ -926,199 +996,257 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	n_rows = len(tab)
 	n_cols = len(tab[0])
 	
-	# Skip high-cardinality columns (they compress better independently)
-	stage_start = time.time()
-	skip_high_card = set()
-	rng = np.random.default_rng(mi_seed)
-	card_check_sample = min(500, n_rows) if n_rows > 500 else n_rows
-	if card_check_sample < n_rows:
-		card_idx = rng.choice(n_rows, size=card_check_sample, replace=False)
-		table_sample = tab[card_idx]
+	# If using line graph baseline, skip all MI computation
+	if use_line_graph:
+		# Line graph baseline: sequential chain col0 -> col1 -> col2 -> ...
+		# Skip all MI computation - just create a simple chain
+		profiler["cardinality_check"] = 0.0
+		profiler["phase1_mi"] = 0.0
+		profiler["phase2_mi"] = 0.0
+		stage_start = time.time()
+		edges = [(i-1, i, 1.0) for i in range(1, n_cols)]  # Simple edges with unit weight
+		parents = [-1] + list(range(n_cols - 1))  # First column is root, others depend on previous
+		profiler["build_forest"] = time.time() - stage_start
 	else:
-		table_sample = tab
-	
-	for i in range(n_cols):
-		col_data = table_sample[:, i]
-		try:
-			col_unique = len(np.unique(col_data))
-		except (TypeError, ValueError):
-			sample_size = min(100, len(col_data))
-			if sample_size < len(col_data):
-				sample_idx = rng.choice(len(col_data), size=sample_size, replace=False)
-				col_unique = len(set(col_data[sample_idx].tolist()))
-			else:
-				if col_data.dtype == object:
-					col_unique = len(set(col_data.tolist()))
+		# Skip high-cardinality columns (they compress better independently)
+		stage_start = time.time()
+		skip_high_card = set()
+		rng = np.random.default_rng(mi_seed)
+		card_check_sample = min(500, n_rows) if n_rows > 500 else n_rows
+		if card_check_sample < n_rows:
+			card_idx = rng.choice(n_rows, size=card_check_sample, replace=False)
+			table_sample = tab[card_idx]
+		else:
+			table_sample = tab
+		
+		for i in range(n_cols):
+			col_data = table_sample[:, i]
+			try:
+				col_unique = len(np.unique(col_data))
+			except (TypeError, ValueError):
+				sample_size = min(100, len(col_data))
+				if sample_size < len(col_data):
+					sample_idx = rng.choice(len(col_data), size=sample_size, replace=False)
+					col_unique = len(set(col_data[sample_idx].tolist()))
 				else:
-					col_unique = len(set(col_data.flatten().tolist()))
-		threshold = int(0.5 * card_check_sample)
-		if col_unique > threshold:
-			skip_high_card.add(i)
-	profiler["cardinality_check"] = time.time() - stage_start
-	
-	# Build MDL-weighted forest using two-phase approach
-	# The function returns (phase1_edges, refined_edges) for separate timing
-	# We need to time phase1 and phase2 separately, so we'll do it in two calls
-	# Actually, let's refactor to time inside the function or split the phases
-	# For now, let's keep the existing inline code but move the forest building part
-	# Phase 1: Fast ranking with proxy MDL on all edge pairs
-	# For datasets <= 10k rows, can afford to use exact MI throughout for better accuracy
-	use_exact_mi_phase1 = (n_rows <= 10000)
-	
-	if mi_sample is None:
-		# Use larger samples for better accuracy, especially for large datasets
-		# Sample size should scale with dataset size but with diminishing returns
-		if n_rows > 1_000_000:
-			# For very large datasets (>1M rows), use 50k-100k samples for phase 1
-			phase1_sample = min(100_000, n_rows // 35)  # ~2.8% of data, up to 100k
-		elif n_rows > 100_000:
-			# For large datasets (100k-1M rows), use 20k-50k samples
-			phase1_sample = min(50_000, n_rows // 20)  # ~5% of data, up to 50k
-		elif n_rows > 10_000:
-			phase1_sample = min(10_000, n_rows // 2) if use_exact_mi_phase1 else min(5_000, n_rows // 4)
-		elif n_rows > 1_000:
-			phase1_sample = min(3_000, n_rows // 2) if use_exact_mi_phase1 else min(2_000, n_rows // 3)
+					if col_data.dtype == object:
+						col_unique = len(set(col_data.tolist()))
+					else:
+						col_unique = len(set(col_data.flatten().tolist()))
+			threshold = int(0.5 * card_check_sample)
+			if col_unique > threshold:
+				skip_high_card.add(i)
+		profiler["cardinality_check"] = time.time() - stage_start
+		
+		# Build MDL-weighted forest using two-phase approach
+		# The function returns (phase1_edges, refined_edges) for separate timing
+		# We need to time phase1 and phase2 separately, so we'll do it in two calls
+		# Actually, let's refactor to time inside the function or split the phases
+		# For now, let's keep the existing inline code but move the forest building part
+		# Phase 1: Fast ranking with proxy MDL on all edge pairs
+		# For datasets <= 10k rows, can afford to use exact MI throughout for better accuracy
+		use_exact_mi_phase1 = (n_rows <= 10000)
+		
+		if mi_sample is None:
+			# Use larger samples for better accuracy, especially for large datasets
+			# Sample size should scale with dataset size but with diminishing returns
+			if n_rows > 1_000_000:
+				# For very large datasets (>1M rows), use 50k-100k samples for phase 1
+				phase1_sample = min(100_000, n_rows // 35)  # ~2.8% of data, up to 100k
+			elif n_rows > 100_000:
+				# For large datasets (100k-1M rows), use 20k-50k samples
+				phase1_sample = min(50_000, n_rows // 20)  # ~5% of data, up to 50k
+			elif n_rows > 10_000:
+				phase1_sample = min(10_000, n_rows // 2) if use_exact_mi_phase1 else min(5_000, n_rows // 4)
+			elif n_rows > 1_000:
+				phase1_sample = min(3_000, n_rows // 2) if use_exact_mi_phase1 else min(2_000, n_rows // 3)
+			else:
+				phase1_sample = None  # Use full data for small datasets
 		else:
-			phase1_sample = None  # Use full data for small datasets
-	else:
-		phase1_sample = mi_sample
-	
-	# For small datasets, use exact MI throughout for accuracy
-	# For larger datasets, use hashed MI in phase 1 with more buckets, exact in phase 2
-	if mi_mode == "auto":
-		if n_rows <= 10000:
-			phase1_mi_mode = "exact"  # Use exact MI for better accuracy on smaller datasets
+			phase1_sample = mi_sample
+		
+		# For small datasets, use exact MI throughout for accuracy
+		# For larger datasets, use hashed MI in phase 1 with more buckets, exact in phase 2
+		if mi_mode == "auto":
+			if n_rows <= 10000:
+				phase1_mi_mode = "exact"  # Use exact MI for better accuracy on smaller datasets
+			else:
+				phase1_mi_mode = "hashed"  # Use hashed for speed, but with more buckets
+		elif mi_mode == "exact":
+			phase1_mi_mode = "exact"
 		else:
-			phase1_mi_mode = "hashed"  # Use hashed for speed, but with more buckets
-	elif mi_mode == "exact":
-		phase1_mi_mode = "exact"
-	else:
-		phase1_mi_mode = "hashed"
-	
-	# Use more buckets for better accuracy in phase 1 if using hashed
-	# Larger datasets benefit from more buckets to reduce hash collisions
-	if phase1_mi_mode == "hashed":
-		if n_rows > 1_000_000:
-			phase1_buckets = min(mi_buckets * 2, 16384)  # Up to 16k buckets for very large datasets
-		elif n_rows > 100_000:
-			phase1_buckets = min(mi_buckets, 8192)  # Up to 8k buckets
+			phase1_mi_mode = "hashed"
+		
+		# Use more buckets for better accuracy in phase 1 if using hashed
+		# Larger datasets benefit from more buckets to reduce hash collisions
+		if phase1_mi_mode == "hashed":
+			if n_rows > 1_000_000:
+				phase1_buckets = min(mi_buckets * 2, 16384)  # Up to 16k buckets for very large datasets
+			elif n_rows > 100_000:
+				phase1_buckets = min(mi_buckets, 8192)  # Up to 8k buckets
+			else:
+				phase1_buckets = mi_buckets
 		else:
 			phase1_buckets = mi_buckets
-	else:
-		phase1_buckets = mi_buckets
-	
-	# Fast phase: compute weights for all edge pairs with proxy MDL
-	from concurrent.futures import ThreadPoolExecutor
-	import os
-	from .mi import estimate_edge_weight_hashed, estimate_edge_weight
-	
-	def compute_fast_weight(pair):
-		i, j = pair
-		# Skip edges involving high-cardinality columns
-		if i in skip_high_card or j in skip_high_card:
-			return (i, j, -1.0)  # Negative weight to filter out
-		x, y = tab[:, i], tab[:, j]
-		mdl_bits = mdl_cost_fn_fast(x, y, row_sample=phase1_sample, seed=mi_seed)
-		if phase1_mi_mode == "hashed":
-			w = estimate_edge_weight_hashed(n_rows, x, y, mdl_bits, num_buckets=phase1_buckets, row_sample=phase1_sample, seed=mi_seed)
-		else:
-			# Use exact MI for phase 1 if dataset is small enough
-			w = estimate_edge_weight(n_rows, x, y, mdl_bits)
-		return (i, j, w)
-	
-	# Compute all edge pairs (skip high-cardinality columns)
-	stage_start = time.time()
-	all_pairs = [
-		(i, j)
-		for i in range(n_cols)
-		for j in range(i + 1, n_cols)
-		if i not in skip_high_card and j not in skip_high_card
-	]
-	# Guard against degenerate cases where no candidate edges remain (e.g. single-column or all filtered)
-	# ThreadPoolExecutor requires max_workers >= 1.
-	max_workers = max(1, min(len(all_pairs) or 1, int(os.cpu_count() or 4), 16))
-	with ThreadPoolExecutor(max_workers=max_workers) as executor:
-		all_fast_edges = list(executor.map(compute_fast_weight, all_pairs))
-	
-	# Filter negative weights and sort by weight
-	all_fast_edges = [(u, v, w) for u, v, w in all_fast_edges if w > 0.0]
-	all_fast_edges.sort(key=lambda x: x[2], reverse=True)
-	profiler["phase1_mi"] = time.time() - stage_start
-	
-	# Phase 2: Refine top candidates with OpenZL MDL and EXACT MI for accuracy
-	# Use exact MI (not hashed) for final selection - critical for compression ratio
-	# Take more candidates to ensure we don't miss good edges
-	# Scale candidate count with dataset size and number of columns - be extremely aggressive
-	# For large datasets, we can afford to evaluate more edges
-	max_candidates = min(len(all_fast_edges), max(n_cols * 25, 1500), 3000)  # Top 1500-3000 or 25x columns (extremely aggressive)
-	top_candidates = all_fast_edges[:max_candidates]
-	
-	# Re-compute weights with OpenZL MDL + EXACT MI for maximum accuracy
-	# Use larger sample or full data for phase 2 to get accurate MDL cost
-	# Phase 2 needs high accuracy for final edge selection
-	if n_rows <= 10000:
-		# For 10k rows, use full data for maximum accuracy
-		phase2_sample = None
-	elif n_rows > 1_000_000:
-		# For very large datasets, use substantial sample (100k-200k rows)
-		# This is critical for accurate MI estimation
-		phase2_sample = min(200_000, n_rows // 20)  # ~5% of data, up to 200k
-	elif n_rows > 100_000:
-		# For large datasets, use 50k-100k sample
-		phase2_sample = min(100_000, n_rows // 10)  # ~10% of data, up to 100k
-	else:
-		# For medium datasets, use larger sample than phase 1
-		phase2_sample = min(n_rows, max(20_000, n_rows // 5))  # At least 20k or 20% of data
-	
-	def recompute_weight(edge):
-		u, v, _ = edge
-		x_full, y_full = tab[:, u], tab[:, v]
-		# Use same sample for both MDL and MI to ensure consistency
-		if phase2_sample is not None and phase2_sample < n_rows:
+		
+		# Fast phase: compute weights for all edge pairs with proxy MDL
+		# Vectorized approach: pre-sample data once, batch process pairs
+		from concurrent.futures import ThreadPoolExecutor
+		import os
+		from .mi import estimate_edge_weight_hashed, estimate_edge_weight
+		
+		stage_start = time.time()
+		
+		# Pre-sample data once for all pairs (if using sampling)
+		# This avoids repeated sampling per pair - major speedup
+		sampled_table = None
+		sampled_indices = None
+		if phase1_sample is not None and phase1_sample < n_rows:
 			rng = np.random.default_rng(mi_seed)
-			sample_idx = rng.choice(n_rows, size=phase2_sample, replace=False)
-			x_sample = x_full[sample_idx]
-			y_sample = y_full[sample_idx]
-			n_effective = phase2_sample
+			sampled_indices = rng.choice(n_rows, size=phase1_sample, replace=False)
+			sampled_table = tab[sampled_indices]
 		else:
-			x_sample = x_full
-			y_sample = y_full
-			n_effective = n_rows
-		# Use OpenZL MDL for accurate model cost (on sample)
-		# Model cost represents the cost to store the joint histogram, which is approximately
-		# the same for sample vs full data (depends on unique pairs, not total rows)
-		mdl_bits = mdl_cost_fn_openzl(x_sample, y_sample, row_sample=None, seed=mi_seed)
-		# Use EXACT MI (not hashed) for accurate mutual information
-		# Compute MI on sample - this estimates the true MI which scales with data
-		from .mi import compute_empirical_mi
-		mi_nats = compute_empirical_mi(x_sample, y_sample)
-		mi_bits = mi_nats / np.log(2.0)
-		# Edge weight: n_rows * I(X;Y) - model_cost
-		# MI benefit scales with n_rows, but model cost is fixed (depends on unique pairs)
-		w = n_rows * mi_bits - mdl_bits
-		return (u, v, w)
-	
-	stage_start = time.time()
-	if top_candidates:
-		max_workers = max(1, min(len(top_candidates), int(os.cpu_count() or 4), 8))
+			sampled_table = tab
+			sampled_indices = None
+		
+		# Compute all edge pairs (skip high-cardinality columns)
+		all_pairs = [
+			(i, j)
+			for i in range(n_cols)
+			for j in range(i + 1, n_cols)
+			if i not in skip_high_card and j not in skip_high_card
+		]
+		
+		# Vectorized batch processing: process pairs in batches
+		# This reduces function call overhead and allows better cache usage
+		def compute_fast_weight_batch(pairs_batch):
+			"""Process a batch of pairs together for better cache locality."""
+			results = []
+			for i, j in pairs_batch:
+				# Skip edges involving high-cardinality columns
+				if i in skip_high_card or j in skip_high_card:
+					results.append((i, j, -1.0))
+					continue
+				
+				# Use pre-sampled data if available (major speedup - no per-pair sampling)
+				if sampled_indices is not None:
+					x, y = sampled_table[:, i], sampled_table[:, j]
+				else:
+					x, y = tab[:, i], tab[:, j]
+				
+				# Fast MDL cost (no sampling needed since we already sampled)
+				mdl_bits = mdl_cost_fn_fast(x, y, row_sample=None, seed=mi_seed)
+				
+				if phase1_mi_mode == "hashed":
+					# For hashed MI, pass the pre-sampled data directly
+					# estimate_edge_weight_hashed will use the data as-is if row_sample=None
+					w = estimate_edge_weight_hashed(n_rows, x, y, mdl_bits, 
+					                                 num_buckets=phase1_buckets, 
+					                                 row_sample=None, seed=mi_seed)
+				else:
+					# Use exact MI on pre-sampled data for speed
+					# But scale MI by n_rows for correct weight
+					if sampled_indices is not None:
+						# Compute MI on sample, then scale
+						from .mi import compute_empirical_mi
+						mi_nats = compute_empirical_mi(x, y)
+						mi_bits = mi_nats / np.log(2.0)
+						# Scale MI benefit by full n_rows (MI scales with data size)
+						w = n_rows * mi_bits - mdl_bits
+					else:
+						w = estimate_edge_weight(n_rows, x, y, mdl_bits)
+				results.append((i, j, w))
+			return results
+		
+		# Process in batches for better cache locality and reduced overhead
+		# Larger batches = less overhead but more memory
+		# Guard against degenerate cases where no candidate edges remain
+		max_workers = max(1, min(len(all_pairs) or 1, int(os.cpu_count() or 4), 16))
+		batch_size = max(1, min(50, len(all_pairs) // (max_workers * 4) + 1))
+		batches = [all_pairs[i:i+batch_size] for i in range(0, len(all_pairs), batch_size)]
+		
+		all_fast_edges = []
 		with ThreadPoolExecutor(max_workers=max_workers) as executor:
-			refined_edges = list(executor.map(recompute_weight, top_candidates))
-	else:
-		refined_edges = []
-	
-	# Filter negative weights
-	refined_edges = [(u, v, w) for u, v, w in refined_edges if w > 0.0]
-	profiler["phase2_mi"] = time.time() - stage_start
-	
-	# Build maximum-weight forest from refined edges using function from forest.py
-	stage_start = time.time()
-	edges = build_maximum_weight_forest(n_cols, refined_edges)
-	profiler["build_forest"] = time.time() - stage_start
-	
-	# Orient forest to get parent array
-	stage_start = time.time()
-	parents = orient_forest(len(df.columns), [(int(u), int(v), float(w)) for u, v, w in edges])
-	profiler["build_forest"] += time.time() - stage_start
+			batch_results = executor.map(compute_fast_weight_batch, batches)
+			for batch_result in batch_results:
+				all_fast_edges.extend(batch_result)
+		
+		# Filter negative weights and sort by weight
+		all_fast_edges = [(u, v, w) for u, v, w in all_fast_edges if w > 0.0]
+		all_fast_edges.sort(key=lambda x: x[2], reverse=True)
+		profiler["phase1_mi"] = time.time() - stage_start
+		
+		# Phase 2: Refine top candidates with OpenZL MDL and EXACT MI for accuracy
+		# Use exact MI (not hashed) for final selection - critical for compression ratio
+		# Take more candidates to ensure we don't miss good edges
+		# Scale candidate count with dataset size and number of columns - be extremely aggressive
+		# For large datasets, we can afford to evaluate more edges
+		max_candidates = min(len(all_fast_edges), max(n_cols * 25, 1500), 3000)  # Top 1500-3000 or 25x columns (extremely aggressive)
+		top_candidates = all_fast_edges[:max_candidates]
+		
+		# Re-compute weights with OpenZL MDL + EXACT MI for maximum accuracy
+		# Use larger sample or full data for phase 2 to get accurate MDL cost
+		# Phase 2 needs high accuracy for final edge selection
+		if n_rows <= 10000:
+			# For 10k rows, use full data for maximum accuracy
+			phase2_sample = None
+		elif n_rows > 1_000_000:
+			# For very large datasets, use substantial sample (100k-200k rows)
+			# This is critical for accurate MI estimation
+			phase2_sample = min(200_000, n_rows // 20)  # ~5% of data, up to 200k
+		elif n_rows > 100_000:
+			# For large datasets, use 50k-100k sample
+			phase2_sample = min(100_000, n_rows // 10)  # ~10% of data, up to 100k
+		else:
+			# For medium datasets, use larger sample than phase 1
+			phase2_sample = min(n_rows, max(20_000, n_rows // 5))  # At least 20k or 20% of data
+		
+		def recompute_weight(edge):
+			u, v, _ = edge
+			x_full, y_full = tab[:, u], tab[:, v]
+			# Use same sample for both MDL and MI to ensure consistency
+			if phase2_sample is not None and phase2_sample < n_rows:
+				rng = np.random.default_rng(mi_seed)
+				sample_idx = rng.choice(n_rows, size=phase2_sample, replace=False)
+				x_sample = x_full[sample_idx]
+				y_sample = y_full[sample_idx]
+				n_effective = phase2_sample
+			else:
+				x_sample = x_full
+				y_sample = y_full
+				n_effective = n_rows
+			# Use OpenZL MDL for accurate model cost (on sample)
+			# Model cost represents the cost to store the joint histogram, which is approximately
+			# the same for sample vs full data (depends on unique pairs, not total rows)
+			mdl_bits = mdl_cost_fn_openzl(x_sample, y_sample, row_sample=None, seed=mi_seed)
+			# Use EXACT MI (not hashed) for accurate mutual information
+			# Compute MI on sample - this estimates the true MI which scales with data
+			from .mi import compute_empirical_mi
+			mi_nats = compute_empirical_mi(x_sample, y_sample)
+			mi_bits = mi_nats / np.log(2.0)
+			# Edge weight: n_rows * I(X;Y) - model_cost
+			# MI benefit scales with n_rows, but model cost is fixed (depends on unique pairs)
+			w = n_rows * mi_bits - mdl_bits
+			return (u, v, w)
+		
+		stage_start = time.time()
+		if top_candidates:
+			max_workers = max(1, min(len(top_candidates), int(os.cpu_count() or 4), 8))
+			with ThreadPoolExecutor(max_workers=max_workers) as executor:
+				refined_edges = list(executor.map(recompute_weight, top_candidates))
+		else:
+			refined_edges = []
+		
+		# Filter negative weights
+		refined_edges = [(u, v, w) for u, v, w in refined_edges if w > 0.0]
+		profiler["phase2_mi"] = time.time() - stage_start
+		
+		# Build maximum-weight forest from refined edges using function from forest.py
+		stage_start = time.time()
+		edges = build_maximum_weight_forest(n_cols, refined_edges)
+		# Orient forest to get parent array
+		parents = orient_forest(len(df.columns), [(int(u), int(v), float(w)) for u, v, w in edges])
+		profiler["build_forest"] = time.time() - stage_start
 	
 	stage_start = time.time()
 	indices, dicts, rare_blobs, is_numeric = _tokenize_columns(df, rare_threshold=rare_threshold)
@@ -1181,15 +1309,20 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		model.rare_meta.append(f"_neural_metadata:{json.dumps(neural_metadata)}")
 		model_bytes = model.to_bytes()
 
-	# Compress frames with an additional layer for better compression
+	# Compress frames with OpenZL for better compression
 	# This helps especially when frames have redundancy or patterns
-	# NOTE: Frame compression is disabled due to OpenZL decompression issues with small frames
-	# TODO: Re-enable once we can reliably compress/decompress all frame sizes
+	# Use more aggressive compression: try compressing frames >= 30 bytes (lower threshold)
 	compressed_frames = []
 	for frame in frames:
-		# For now, don't compress frames - just store them uncompressed
-		# This avoids OpenZL "Internal buffer too small" errors on decompression
-		compressed_frames.append((False, frame))
+		# Use more aggressive threshold: compress frames >= 30 bytes for better compression
+		# This can help with medium-sized frames that have redundancy
+		compressed = generic_bytes_compress(frame, min_size=30)
+		# Check if compression actually happened (compressed != original)
+		if compressed != frame and len(compressed) >= 30:
+			compressed_frames.append((True, compressed))
+		else:
+			# Either compression didn't help or result is too small - store uncompressed
+			compressed_frames.append((False, frame))
 
 	stage_start = time.time()
 	with outp.open("wb") as f:
@@ -1283,38 +1416,9 @@ def decompress_file(input_path: str, output_path: str) -> None:
 			
 			# Decompress if needed
 			if is_compressed:
-				try:
-					frame_data = generic_bytes_decompress(frame_data)
-				except RuntimeError as e:
-					# Frame compression is currently disabled, so this shouldn't happen with new files.
-					# If we encounter a compressed frame, it's from an old file format.
-					# The error might also be from OpenZL issues with small compressed data.
-					error_msg = str(e)
-					if "Internal buffer too small" in error_msg or "error code: 71" in error_msg:
-						if flen < 50:
-							raise RuntimeError(
-								f"Failed to decompress frame {frame_idx} of {ncols} columns. "
-								f"Compressed frame is too small ({flen} bytes) for reliable OpenZL decompression. "
-								f"This may be from an old file format with frame compression, or a compression issue. "
-								f"Please recompress the file with the current version. "
-								f"Original error: {e}"
-							) from e
-						else:
-							raise RuntimeError(
-								f"Failed to decompress frame {frame_idx} of {ncols} columns. "
-								f"This file was created with frame compression enabled, which has known issues. "
-								f"Please recompress the file with the current version (frame compression is now disabled). "
-								f"Compressed frame length: {flen} bytes. "
-								f"Original error: {e}"
-							) from e
-					else:
-						# Other errors should still be raised
-						raise RuntimeError(
-							f"Failed to decompress frame {frame_idx} of {ncols} columns. "
-							f"Compressed frame length: {flen} bytes, "
-							f"Data remaining after frame: {len(data) - p} bytes. "
-							f"Original error: {e}"
-						) from e
+				# Use generic_bytes_decompress with fallback for safety
+				# This handles OpenZL decompression with proper error handling
+				frame_data = generic_bytes_decompress(frame_data, fallback_to_uncompressed=False)
 			frames.append(frame_data)
 	else:
 		# Legacy version: fixed 8-byte frame lengths
@@ -1355,6 +1459,55 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	MISSING_TOKEN = "nan"
 	
 	for col_idx, (name, ids, vocab) in enumerate(zip(model.columns, indices, model.dicts)):
+		# Handle sparse format first (ids is bytes, not numpy array)
+		if isinstance(ids, bytes) and isinstance(vocab, tuple) and len(vocab) == 2 and vocab[0] == "_sparse":
+			# Sparse numeric format: sentinel value + sparse indices + sparse values
+			sentinel_value, scale = vocab[1]
+			from .codec import decompress_numeric_array
+			from .conditional import _decode_varint
+			import struct
+			
+			# Decode sparse format
+			ptr = 0
+			sentinel = struct.unpack("<q", ids[ptr:ptr+8])[0]  # 8 bytes for sentinel
+			ptr += 8
+			non_sentinel_count, bytes_read = _decode_varint(ids, ptr, signed=False)
+			ptr += bytes_read
+			
+			# Decode delta-encoded indices
+			indices_list = []
+			prev_idx = -1
+			for _ in range(non_sentinel_count):
+				delta, bytes_read = _decode_varint(ids, ptr, signed=False)
+				ptr += bytes_read
+				idx = prev_idx + delta
+				indices_list.append(idx)
+				prev_idx = idx
+			
+			# Decode compressed values
+			compressed_values = ids[ptr:]
+			sparse_values = decompress_numeric_array(compressed_values)
+			
+			# Reconstruct full array
+			full_array = np.full(n_rows, sentinel, dtype=np.int64)
+			for idx, val in zip(indices_list, sparse_values):
+				if idx < n_rows:
+					full_array[idx] = val
+			
+			# Apply scale if needed
+			if scale != 1:
+				reconstructed = []
+				for x in full_array.tolist():
+					val = float(x) / scale
+					if scale == 1:
+						reconstructed.append(str(int(val)))
+					else:
+						reconstructed.append(str(val))
+				rec_cols[name] = reconstructed
+			else:
+				rec_cols[name] = [str(int(x)) for x in full_array.tolist()]
+			continue
+		
 		if vocab is None:
 			# Numeric column: output as strings to match original CSV format
 			# Since we only store integers in numeric columns, output as integers
@@ -1362,9 +1515,12 @@ def decompress_file(input_path: str, output_path: str) -> None:
 			rec_cols[name] = [str(x) for x in ids.tolist()]
 			continue
 		elif isinstance(vocab, tuple) and len(vocab) == 2:
-			# Special numeric format: scaled float or raw float
+			# Special numeric format: scaled float, raw float, or sparse
 			format_type, scale_info = vocab
-			if format_type == "_scale":
+			if format_type == "_sparse":
+				# Should have been handled above
+				pass
+			elif format_type == "_scale":
 				# Scaled float: divide by scale factor
 				scale = scale_info
 				# Reconstruct values
@@ -1568,6 +1724,7 @@ def main() -> None:
 	pc.add_argument("--workers", type=int, default=None, help="Parallel workers for column/bucket compression")
 	pc.add_argument("--use-mlp", action="store_true", help="Use tiny MLP models for conditional compression (experimental)")
 	pc.add_argument("--use-neural", action="store_true", help="Use neural autoregressive compression (fully ML-based)")
+	pc.add_argument("--use-line-graph", action="store_true", help="Use line graph baseline (sequential chain) instead of learned tree")
 
 	pdcp = sub.add_parser("decompress", help="Decompress to CSV")
 	pdcp.add_argument("--input", required=True)
@@ -1578,7 +1735,7 @@ def main() -> None:
 	if args.cmd == "prepare":
 		_prepare_raw_to_csv(Path(args.input), Path(args.output), header=args.has_header)
 	elif args.cmd == "compress":
-		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural)
+		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural, use_line_graph=args.use_line_graph)
 	elif args.cmd == "decompress":
 		decompress_file(args.input, args.output)
 	else:

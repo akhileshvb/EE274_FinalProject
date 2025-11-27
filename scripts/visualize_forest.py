@@ -46,19 +46,36 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         print(f"Error: Could not load model from {tabcl_file}: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Create graph
-    G = nx.Graph()
+    # Create directed graph to show parent->child relationships (learned tree structure)
+    G = nx.DiGraph()
     n_cols = len(model.columns)
     G.add_nodes_from(range(n_cols))
     
-    # Add edges with weights
+    # Add edges based on parent relationships (this shows the learned tree structure)
+    # Each edge goes from parent to child
+    for child_idx, parent_idx in enumerate(model.parents):
+        if parent_idx >= 0:  # Has a parent
+            # Find the edge weight from model.edges
+            weight = 1.0
+            for edge in model.edges:
+                if len(edge) >= 3:
+                    u, v, w = int(edge[0]), int(edge[1]), float(edge[2])
+                    if (u == parent_idx and v == child_idx) or (u == child_idx and v == parent_idx):
+                        weight = w
+                        break
+            G.add_edge(parent_idx, child_idx, weight=weight)
+    
+    # Also add edges from model.edges for visualization (in case some are missing from parents)
     for edge in model.edges:
         if len(edge) >= 3:
             u, v, w = int(edge[0]), int(edge[1]), float(edge[2])
-            G.add_edge(u, v, weight=w)
+            if not G.has_edge(u, v) and not G.has_edge(v, u):
+                # Add as undirected edge if not already in parent structure
+                G.add_edge(u, v, weight=w)
         elif len(edge) == 2:
             u, v = int(edge[0]), int(edge[1])
-            G.add_edge(u, v, weight=1.0)
+            if not G.has_edge(u, v) and not G.has_edge(v, u):
+                G.add_edge(u, v, weight=1.0)
     
     if len(G.edges()) == 0:
         print("Warning: No edges found in forest (all columns are independent)", file=sys.stderr)
@@ -74,20 +91,22 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
     fig, ax = plt.subplots(figsize=figsize)
     
     # Choose layout with better spacing for dense graphs
+    # For directed graphs, convert to undirected for layout computation
+    G_layout = G.to_undirected() if isinstance(G, nx.DiGraph) else G
     if layout == "spring":
         # Increase k (optimal distance) for better spacing in dense graphs
         k = max(3.0, np.sqrt(n_nodes) * 0.8) if n_nodes > 20 else 2.0
-        pos = nx.spring_layout(G, k=k, iterations=100, seed=42)
+        pos = nx.spring_layout(G_layout, k=k, iterations=100, seed=42)
     elif layout == "circular":
-        pos = nx.circular_layout(G)
+        pos = nx.circular_layout(G_layout)
     elif layout == "hierarchical":
-        # Try to create a hierarchical layout based on parent relationships
+        # Create a hierarchical layout based on parent relationships (best for showing learned tree)
         try:
             # Use parent array to create hierarchy
             pos = {}
             roots = [i for i, p in enumerate(model.parents) if p == -1]
             if roots:
-                # Simple hierarchical layout
+                # Build level structure from parent relationships
                 levels = {}
                 def get_level(node):
                     if node in levels:
@@ -102,32 +121,63 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                     levels[i] = get_level(i)
                 
                 max_level = max(levels.values()) if levels else 0
+                # Distribute nodes at each level horizontally
+                level_nodes = {}
                 for i in range(n_cols):
                     level = levels.get(i, 0)
-                    y = max_level - level
-                    # Distribute nodes at same level horizontally
-                    same_level = [j for j in range(n_cols) if levels.get(j, 0) == level]
-                    x = same_level.index(i) - len(same_level) / 2
-                    pos[i] = (x, y)
+                    if level not in level_nodes:
+                        level_nodes[level] = []
+                    level_nodes[level].append(i)
+                
+                # Position nodes: roots at top, children below
+                # Use better spacing to prevent overlap - significantly increased for much wider spread
+                min_node_spacing = 10.0  # Minimum horizontal spacing between nodes (significantly increased)
+                vertical_spacing = 3.0  # Vertical spacing between levels (increased from 2.0)
+                
+                for level in sorted(level_nodes.keys()):
+                    nodes_at_level = level_nodes[level]
+                    y = (max_level - level) * vertical_spacing  # Roots at top, children below
+                    
+                    # Calculate spacing to ensure no overlap
+                    # For roots (level 0), ensure they're well-spaced
+                    if level == 0:
+                        # Roots: space them evenly with good separation
+                        total_width = max(len(nodes_at_level) * min_node_spacing, 25.0)
+                        spacing = total_width / max(len(nodes_at_level), 1)
+                    else:
+                        # For other levels, use adaptive spacing based on number of nodes
+                        # Use much wider spacing for levels with more nodes
+                        total_width = max(len(nodes_at_level) * min_node_spacing, 35.0)
+                        spacing = total_width / max(len(nodes_at_level), 1)
+                    
+                    # Center the nodes horizontally
+                    start_x = -(len(nodes_at_level) - 1) * spacing / 2
+                    for idx, node in enumerate(nodes_at_level):
+                        x = start_x + idx * spacing
+                        pos[node] = (x, y)
             else:
-                pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
-        except:
-            pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
+                # Fallback if no roots found
+                pos = nx.spring_layout(G_layout, k=2, iterations=50, seed=42)
+        except Exception as e:
+            print(f"Warning: Hierarchical layout failed: {e}, using spring layout", file=sys.stderr)
+            pos = nx.spring_layout(G_layout, k=2, iterations=50, seed=42)
     elif layout == "kamada_kawai":
-        pos = nx.kamada_kawai_layout(G)
+        pos = nx.kamada_kawai_layout(G_layout)
     elif layout == "force":
         # Force-directed layout with better parameters for dense graphs
         k = max(4.0, np.sqrt(n_nodes) * 1.2) if n_nodes > 20 else 3.0
-        pos = nx.spring_layout(G, k=k, iterations=200, seed=42)
+        pos = nx.spring_layout(G_layout, k=k, iterations=200, seed=42)
     else:
         k = max(3.0, np.sqrt(n_nodes) * 0.8) if n_nodes > 20 else 2.0
-        pos = nx.spring_layout(G, k=k, iterations=100, seed=42)
+        pos = nx.spring_layout(G_layout, k=k, iterations=100, seed=42)
     
     # Post-process layout to prevent node overlap
-    # Increase minimum distance between nodes
-    min_distance = 0.3
-    max_iterations = 50
-    for _ in range(max_iterations):
+    # Increase minimum distance between nodes (larger for better separation)
+    # Account for node sizes - nodes are large (2500-3200 in node_size units)
+    # In layout coordinates, we need at least 1.5-2.0 units of separation for good visibility
+    min_distance = 1.8  # Increased from 1.0 to spread nodes out more
+    max_iterations = 100  # More iterations for better separation
+    for iteration in range(max_iterations):
         moved = False
         for i in range(n_cols):
             if i not in pos:
@@ -139,14 +189,35 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                 dy = pos[i][1] - pos[j][1]
                 dist = np.sqrt(dx*dx + dy*dy)
                 if dist < min_distance and dist > 0:
-                    # Push nodes apart
-                    move_x = dx * (min_distance - dist) / (2 * dist + 1e-6)
-                    move_y = dy * (min_distance - dist) / (2 * dist + 1e-6)
+                    # Push nodes apart more aggressively
+                    overlap = min_distance - dist
+                    move_x = (dx / (dist + 1e-6)) * overlap * 0.6  # Move each node 60% of overlap
+                    move_y = (dy / (dist + 1e-6)) * overlap * 0.6
                     pos[i] = (pos[i][0] + move_x, pos[i][1] + move_y)
                     pos[j] = (pos[j][0] - move_x, pos[j][1] - move_y)
                     moved = True
         if not moved:
             break
+    
+    # Additional pass: ensure roots (level 0) are well-separated
+    if layout == "hierarchical":
+        roots = [i for i, p in enumerate(model.parents) if p == -1]
+        if len(roots) > 1:
+            # Sort roots by x position
+            root_positions = [(i, pos[i]) for i in roots if i in pos]
+            root_positions.sort(key=lambda x: x[1][0])
+            
+            # Ensure minimum spacing between roots (increased for more spread)
+            root_min_spacing = 10.0  # Increased for much wider spacing
+            for idx in range(1, len(root_positions)):
+                prev_node, prev_pos = root_positions[idx - 1]
+                curr_node, curr_pos = root_positions[idx]
+                dx = curr_pos[0] - prev_pos[0]
+                if abs(dx) < root_min_spacing:
+                    # Move current root to the right
+                    new_x = prev_pos[0] + root_min_spacing
+                    pos[curr_node] = (new_x, curr_pos[1])
+                    root_positions[idx] = (curr_node, (new_x, curr_pos[1]))
     
     # Draw nodes
     # Identify connected vs isolated nodes
@@ -210,34 +281,40 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         node_sizes.append(size)
     
     # Draw edges first (so they're behind nodes)
-    # Draw edges with weights as edge width
-    if show_weights and G.edges():
+    # Draw edges with weights as edge width and arrows to show parent->child direction
+    if G.edges():
         edges = list(G.edges())
         weights = [G[u][v].get("weight", 1.0) for u, v in edges]
-        if weights:
+        if weights and show_weights:
             max_weight = max(weights)
             min_weight = min(weights)
             if max_weight > min_weight:
-                # Normalize weights to [0.5, 3.0] for edge width
-                edge_widths = [(w - min_weight) / (max_weight - min_weight) * 2.5 + 0.5 
+                # Normalize weights to [1.0, 4.0] for edge width (thicker = stronger dependency)
+                edge_widths = [(w - min_weight) / (max_weight - min_weight) * 3.0 + 1.0 
                               for w in weights]
             else:
-                edge_widths = [2.0] * len(edges)
+                edge_widths = [2.5] * len(edges)
             
             # Color edges dark green (varying intensity based on weight)
             if max_weight > min_weight:
                 # Normalize weights to [0, 1] and map to dark green shades
                 normalized_weights = [(w - min_weight) / (max_weight - min_weight) for w in weights]
-                # Use dark green color map (darker green = higher weight)
+                # Use dark green color map (darker green = higher weight = stronger dependency)
                 edge_colors = [plt.cm.Greens(0.3 + 0.7 * nw) for nw in normalized_weights]
             else:
                 edge_colors = ["darkgreen"] * len(edges)
         else:
-            edge_widths = [2.0] * len(edges)
-            edge_colors = "gray"
+            edge_widths = [2.5] * len(edges)
+            edge_colors = "darkgreen"
         
+        # Draw directed edges with arrows to show parent->child relationships
+        # Connect arrows directly to nodes (no margin)
         nx.draw_networkx_edges(G, pos, ax=ax, width=edge_widths, 
-                             alpha=0.7, edge_color=edge_colors)
+                             alpha=0.8, edge_color=edge_colors,
+                             arrows=True, arrowsize=30, arrowstyle='->',
+                             connectionstyle='arc3,rad=0.1',  # Slight curve for better visibility
+                             node_size=node_sizes,  # Pass node sizes for proper arrow positioning
+                             min_source_margin=0, min_target_margin=0)  # Connect directly to nodes
     
     # Draw nodes after edges (so nodes are on top)
     nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, 
@@ -274,9 +351,15 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                                             rotate=False,  # Don't rotate labels
                                             )
     else:
-        nx.draw_networkx_edges(G, pos, ax=ax, width=2.0, alpha=0.6, edge_color="gray")
+        # Draw edges without weights (uniform)
+        # Connect arrows directly to nodes (no margin)
+        nx.draw_networkx_edges(G, pos, ax=ax, width=2.5, alpha=0.7, edge_color="darkgreen",
+                             arrows=True, arrowsize=30, arrowstyle='->',
+                             connectionstyle='arc3,rad=0.1',
+                             node_size=node_sizes,
+                             min_source_margin=0, min_target_margin=0)  # Connect directly to nodes
     
-        # Draw labels
+    # Draw labels
     if show_labels:
         if col_names and model.columns:
             # Use actual column names (truncate if too long)
@@ -301,9 +384,10 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
     n_roots = sum(1 for p in model.parents if p == -1)
     n_children = n_cols - n_roots
     
-    # Find connected components
+    # Find connected components (convert to undirected for this check)
     if G.edges():
-        components = list(nx.connected_components(G))
+        G_undirected = G.to_undirected()
+        components = list(nx.connected_components(G_undirected))
         n_components = len(components)
         largest_component_size = max(len(c) for c in components) if components else 0
     else:
@@ -326,8 +410,11 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         print(f"  Edge weight range: [{min(weights):.2f}, {max(weights):.2f}]")
     print()
     
-    # Simple title
-    ax.set_title("Forest Structure", fontsize=32, fontweight="bold", pad=25)
+    # Title showing this is the learned tree structure
+    title = "Learned Dependency Tree Structure"
+    if n_components > 1:
+        title += f" ({n_components} trees)"
+    ax.set_title(title, fontsize=32, fontweight="bold", pad=25)
     ax.axis("off")
     
     # Add legend
@@ -384,7 +471,7 @@ Examples:
     parser.add_argument("-o", "--output", type=Path, default=None,
                        help="Output file path (if not specified, displays interactively)")
     parser.add_argument("--layout", choices=["spring", "circular", "hierarchical", "kamada_kawai", "force"],
-                       default="spring", help="Graph layout algorithm (default: spring). 'force' uses force-directed layout with better spacing.")
+                       default="hierarchical", help="Graph layout algorithm (default: hierarchical). 'hierarchical' shows parent->child relationships best.")
     parser.add_argument("--no-labels", action="store_true",
                        help="Hide node labels")
     parser.add_argument("--no-weights", action="store_true",

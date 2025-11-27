@@ -101,19 +101,23 @@ def generate_linear_correlated_data(n_rows: int, correlation: float, seed: int =
     return parent, child
 
 
-def generate_tree_structured_data(n_rows: int, tree_depth: int, branches_per_node: int = 2, seed: int = 0):
+def generate_tree_structured_data(n_rows: int, tree_depth: int, branches_per_node: int = 2, 
+                                   correlation_strength: float = 0.95, seed: int = 0):
     """
     Generate data with explicit tree-structured dependencies.
     
     Creates a tree where:
     - Root nodes are independent
     - Each level depends on the previous level
-    - Strong correlations ensure high MI (95% deterministic, 5% noise)
+    - Correlation strength controls dependency (0.0 = independent, 1.0 = fully deterministic)
     
     Args:
         n_rows: Number of rows
         tree_depth: Depth of the tree (number of levels)
         branches_per_node: Number of children per node
+        correlation_strength: Strength of correlation (0.0 to 1.0). 
+                            0.0 = independent (no correlation)
+                            1.0 = fully deterministic (maximum correlation)
         seed: Random seed
     
     Returns:
@@ -149,21 +153,26 @@ def generate_tree_structured_data(n_rows: int, tree_depth: int, branches_per_nod
             for child_idx in range(branches_per_node):
                 child_name = f'level_{level}_node_{len(current_level_nodes)}'
                 
-                # Generate child with strong dependency on parent
-                # Use 95% deterministic mapping, 5% noise for high MI
+                # Generate child with controlled dependency on parent
+                # correlation_strength controls how deterministic the mapping is
                 n_values = 10
                 child = np.zeros(n_rows, dtype=int)
                 
-                # Create strong correlation: child = f(parent) with small noise
+                # Create a deterministic mapping function: parent -> child
+                # Use a simple bijection to maximize MI: child = (parent * factor + child_idx) % n_values
+                # This creates a strong, exploitable dependency
+                mapping_factor = 3 + child_idx  # Different factor per child for variety
+                
+                # Create correlation: child = f(parent) with controlled noise
                 for i in range(n_rows):
                     p_val = parent_data[i]
-                    # Deterministic mapping with small random noise (5% noise)
-                    if np.random.random() < 0.95:
-                        # Strong correlation: child = parent (with some variation for uniqueness)
-                        # Use a deterministic function based on parent value and row index
-                        child[i] = (p_val + (i % 3) + child_idx) % n_values
+                    # Use correlation_strength to control determinism
+                    if np.random.random() < correlation_strength:
+                        # Correlated: child = deterministic function of parent (no row index dependency!)
+                        # This creates a strong statistical dependency that tabcl can exploit
+                        child[i] = (p_val * mapping_factor + child_idx) % n_values
                     else:
-                        # Small noise
+                        # Independent: random value
                         child[i] = np.random.randint(0, n_values)
                 
                 columns[child_name] = child
@@ -200,7 +209,9 @@ def generate_dataset_with_varying_mi(n_rows: int = 10000, n_pairs: int = 20, see
         # This gives: 3 roots, 9 level1 nodes, 27 level2 nodes = 39 nodes total
         # Dependencies: 9 + 27 = 36 parent-child pairs
         
-        columns_dict = generate_tree_structured_data(n_rows, tree_depth, branches_per_node, seed)
+        # Use default correlation strength of 0.95 for backward compatibility
+        columns_dict = generate_tree_structured_data(n_rows, tree_depth, branches_per_node, 
+                                                     correlation_strength=0.95, seed=seed)
         return pd.DataFrame(columns_dict)
     else:
         # Original approach: independent pairs
@@ -255,7 +266,9 @@ Examples:
     
     if args.use_tree:
         print(f"Generating tree-structured dataset (depth={args.tree_depth}, branches={args.branches}), {args.n_rows} rows...")
-        columns_dict = generate_tree_structured_data(args.n_rows, args.tree_depth, args.branches, args.seed)
+        # Use default correlation strength of 0.95 for backward compatibility
+        columns_dict = generate_tree_structured_data(args.n_rows, args.tree_depth, args.branches, 
+                                                     correlation_strength=0.95, seed=args.seed)
         df = pd.DataFrame(columns_dict)
     else:
         print(f"Generating synthetic dataset with {args.n_pairs} parent-child pairs, {args.n_rows} rows...")

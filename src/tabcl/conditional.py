@@ -333,8 +333,20 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 	child_ids = [j for j, p in enumerate(parents) if p != -1]
 	if workers is None or workers < 1:
 		workers = 1
+	
+	# Handle sparse columns specially - they're already stored as bytes
+	for j in root_ids:
+		if isinstance(indices[j], bytes):
+			# Sparse format: already compressed bytes, just store directly
+			frames[j] = indices[j]
+		else:
+			# Regular numeric: encode normally
+			encode_root(j)
+	
+	# Encode remaining roots that aren't sparse
+	regular_root_ids = [j for j in root_ids if not isinstance(indices[j], bytes)]
 	with ThreadPoolExecutor(max_workers=workers) as ex:
-		list(ex.map(encode_root, root_ids))
+		list(ex.map(encode_root, regular_root_ids))
 
 	# Encode children (each independently given parent indices are fixed)
 	def encode_child(j: int) -> None:
@@ -451,7 +463,9 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 			
 			# Use variable-length encoding for parent ID and length to save space
 			# For small parent IDs and lengths, use fewer bytes
-			pid_bytes = _encode_varint(pid, signed=False)  # Parent IDs are non-negative
+			# Note: pid here is a value from the parent column, which can be negative
+			# So we need to use signed encoding
+			pid_bytes = _encode_varint(pid, signed=True)  # Parent ID values can be negative
 			parts.append(pid_bytes)
 			# Use varint for length (unsigned since length is always positive)
 			# Note: We use a flag byte to indicate raw storage instead of negative length
@@ -512,7 +526,8 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 				segment_compressed = _try_all_compression_methods(segment, dicts[j])
 				
 				# Add overhead: varint for parent ID + varint for length
-				pid_varint_len = len(_encode_varint(pid, signed=False))
+				# Note: pid here is a value from the parent column, which can be negative
+				pid_varint_len = len(_encode_varint(pid, signed=True))
 				length_varint_len = len(_encode_varint(len(segment_compressed), signed=False))
 				hist_data_bits += (pid_varint_len + length_varint_len + len(segment_compressed)) * 8.0
 			
@@ -575,9 +590,19 @@ def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows:
 	undecoded: set[int] = set()
 	for j, p in enumerate(parents):
 		if p == -1:
-			indices[j] = decompress_numeric_array(frames[j])
-			if indices[j].shape[0] != n_rows:
-				raise RuntimeError("Root length mismatch")
+			# Check if this is sparse format (stored as bytes, not numpy array)
+			# Sparse format will be decoded later in decompress_file
+			# For now, we need to decode it to get n_rows
+			# Actually, sparse format is handled in cli.py during decompression
+			# Here we just need to handle regular numeric arrays
+			try:
+				indices[j] = decompress_numeric_array(frames[j])
+				if indices[j].shape[0] != n_rows:
+					raise RuntimeError("Root length mismatch")
+			except Exception:
+				# Might be sparse format - will be handled in cli.py
+				# For now, mark as decoded but store the frame bytes
+				indices[j] = frames[j]  # Store bytes for sparse format
 		else:
 			undecoded.add(j)
 
@@ -625,12 +650,13 @@ def decode_columns_with_parents(frames: List[bytes], parents: List[int], n_rows:
 			bucket_data: Dict[int, List[int]] = {}
 			
 			# Always try new format (varint) first - this is the current encoding format
+			# Parent ID values can be negative, so use signed=True
 			# Only fall back to old format if varint decoding fails AND we have enough bytes for old format
 			save_ptr = ptr
 			try:
-				# Try to decode all buckets as varints (new format)
+				# Try to decode all buckets as varints (new format with signed parent IDs)
 				for _ in range(nb):
-					pid, bytes_consumed = _decode_varint(frame, ptr, signed=False)
+					pid, bytes_consumed = _decode_varint(frame, ptr, signed=True)  # Parent ID values can be negative
 					ptr += bytes_consumed
 					flen, bytes_consumed = _decode_varint(frame, ptr, signed=False)
 					ptr += bytes_consumed
