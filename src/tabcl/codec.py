@@ -52,13 +52,7 @@ def _gamma_bits(v: int) -> int:
 
 
 def _golomb_bits(v: int, m: int) -> int:
-	"""
-	Compute Golomb encoding length in bits for value v with parameter m.
-	Golomb code: unary part + binary part
-	- Unary: floor(v/m) ones + one zero = floor(v/m) + 1 bits
-	- Binary: k bits where k = ceil(log2(m)) for truncated binary or log2(m) for remainder
-	Optimal m ≈ -ln(2)/ln(p) where p is probability parameter
-	"""
+	"""Approximate Golomb code length (in bits) for value v and parameter m."""
 	if v <= 0:
 		return 1
 	if m <= 1:
@@ -80,11 +74,7 @@ def _golomb_bits(v: int, m: int) -> int:
 
 
 def _optimal_golomb_m(counts: Dict[Tuple[Any, Any], int]) -> int:
-	"""
-	Estimate optimal Golomb parameter m for counts.
-	For geometric distribution with parameter p, optimal m = ceil(-ln(2) / ln(1-p))
-	We estimate p from mean count or use heuristic.
-	"""
+	"""Heuristic choice of Golomb parameter m based on the mean of counts."""
 	if not counts:
 		return 256  # Default
 	all_counts = list(counts.values())

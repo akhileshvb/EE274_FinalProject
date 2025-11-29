@@ -5,8 +5,7 @@ from typing import Optional
 
 def compute_empirical_mi(x: np.ndarray, y: np.ndarray) -> float:
 	"""
-	Empirical mutual information I(X;Y) in nats for discrete arrays.
-	Optimized for performance with high-cardinality data.
+	Empirical mutual information $I(X;Y)$ in nats for discrete arrays.
 	"""
 	if x.shape[0] != y.shape[0]:
 		raise ValueError("x and y must have same length")

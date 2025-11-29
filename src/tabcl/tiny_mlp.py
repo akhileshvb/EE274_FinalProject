@@ -1,8 +1,5 @@
 """
-Tiny MLP extension for MDL tabular compression.
-
-Implements a small multi-layer perceptron (MLP) that can replace histogram-based
-conditional compression for certain columns when MDL indicates it's beneficial.
+Tiny MLP used as an optional conditional model for some columns.
 """
 
 from typing import List, Tuple, Optional, Dict, Any
@@ -24,22 +21,15 @@ except ImportError:
 
 
 class TinyMLP(nn.Module):
-	"""
-	Tiny MLP for conditional probability estimation.
-	
-	Architecture:
-	- Embedding layers for categorical features
-	- 1-2 hidden layers (32-64 units)
-	- Output layer with softmax over child column classes
-	"""
-	
+	"""Small MLP for conditional probability estimation."""
+
 	def __init__(
 		self,
 		embedding_dims: List[int],  # Embedding dimension for each categorical feature
 		embedding_vocab_sizes: List[int],  # Vocabulary size for each categorical feature
-		hidden_dims: List[int] = [64],  # Hidden layer dimensions
-		num_classes: int = 0,  # Number of classes in child column
-		use_gelu: bool = True,  # Use GELU activation (True) or ReLU (False)
+		hidden_dims: List[int] = [64],
+		num_classes: int = 0,
+		use_gelu: bool = True,
 	):
 		if not TORCH_AVAILABLE:
 			raise ImportError("PyTorch is required for MLP extension. Install with: pip install torch")
@@ -76,16 +66,7 @@ class TinyMLP(nn.Module):
 		self.mlp = nn.Sequential(*layers)
 	
 	def forward(self, feature_indices: List[torch.Tensor]) -> torch.Tensor:
-		"""
-		Forward pass.
-		
-		Args:
-			feature_indices: List of tensors, one per categorical feature.
-			                 Each tensor contains indices (long) of shape [batch_size]
-		
-		Returns:
-			Logits of shape [batch_size, num_classes]
-		"""
+		"""Forward pass. Returns logits of shape [batch_size, num_classes]."""
 		# Embed each feature
 		embedded = []
 		for i, indices in enumerate(feature_indices):
@@ -119,44 +100,23 @@ class TinyMLP(nn.Module):
 
 def train_tiny_mlp(
 	child_indices: np.ndarray,
-	parent_indices: Optional[np.ndarray] = None,  # Single parent (for conditional mode)
+	parent_indices: Optional[np.ndarray] = None,
 	embedding_dim: int = 16,
 	hidden_dims: List[int] = [64],
-	num_epochs: int = 15,  # Increased for better learning
+	num_epochs: int = 15,
 	batch_size: int = 2048,
 	learning_rate: float = 0.001,
 	max_samples: Optional[int] = 50000,
 	device: Optional[str] = None,
-	all_unique_children: Optional[np.ndarray] = None,  # All unique child values from full dataset
-	all_unique_parents: Optional[np.ndarray] = None,  # All unique parent values from full dataset
-	# Autoregressive mode parameters:
-	autoregressive_parents: Optional[List[np.ndarray]] = None,  # Multiple parent columns
-	autoregressive_vocab_sizes: Optional[List[int]] = None,  # Vocab sizes for each parent
+	all_unique_children: Optional[np.ndarray] = None,
+	all_unique_parents: Optional[np.ndarray] = None,
+	autoregressive_parents: Optional[List[np.ndarray]] = None,
+	autoregressive_vocab_sizes: Optional[List[int]] = None,
 ) -> Optional[TinyMLP]:
 	"""
-	Train a tiny MLP to predict child column from parent column(s).
-	
-	Supports two modes:
-	1. Conditional mode: single parent column (parent_indices provided)
-	2. Autoregressive mode: multiple parent columns (autoregressive_parents provided)
-	
-	Args:
-		child_indices: Array of child column class indices [n_rows]
-		parent_indices: Array of parent column class indices [n_rows] (conditional mode)
-		embedding_dim: Dimension for each parent embedding
-		hidden_dims: Hidden layer dimensions
-		num_epochs: Number of training epochs
-		batch_size: Batch size for training
-		learning_rate: Learning rate
-		max_samples: Maximum number of samples to use for training (None = all)
-		device: Device to use ('cpu', 'mps', 'cuda', or None for auto)
-		all_unique_children: All unique child values from full dataset
-		all_unique_parents: All unique parent values from full dataset (conditional mode)
-		autoregressive_parents: List of parent column arrays (autoregressive mode)
-		autoregressive_vocab_sizes: Vocab sizes for each parent in autoregressive mode
-	
-	Returns:
-		Trained TinyMLP model, or None if training fails or is skipped
+	Train a TinyMLP to predict a child column from one or more parent columns.
+
+	Returns the trained model, or None if training is skipped or fails.
 	"""
 	if not TORCH_AVAILABLE:
 		return None

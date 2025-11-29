@@ -1,7 +1,4 @@
-"""
-Generate synthetic data with varying mutual information between parent and child columns.
-This allows us to study the relationship between MI and compression gain.
-"""
+"""Generate small synthetic datasets with controlled mutual information."""
 
 import argparse
 import sys
@@ -18,41 +15,19 @@ except ImportError:
 
 def generate_correlated_data(n_rows: int, mi_target: float, seed: int = 0):
     """
-    Generate two correlated columns with approximately target MI.
-    
-    Uses a deterministic mapping: child = f(parent) with controlled noise.
-    Higher MI = more deterministic mapping.
-    
-    Args:
-        n_rows: Number of rows
-        mi_target: Target mutual information in bits
-        seed: Random seed
-    
-    Returns:
-        (parent, child) arrays with approximately target MI
+	Generate two discrete columns with roughly the desired MI (in bits).
     """
     np.random.seed(seed)
     
-    # Generate parent column (uniform categorical)
-    n_parent_values = 20  # More values for better MI control
+	# Parent is uniform categorical.
+	n_parent_values = 20
     parent = np.random.randint(0, n_parent_values, size=n_rows)
     
-    # Generate child column based on parent with controlled correlation
-    # Strategy: child = deterministic_function(parent) + noise
-    # MI is controlled by the noise level
-    
-    # Convert MI target to a noise probability
-    # Higher MI = lower noise = more deterministic
-    # For categorical data, we can approximate:
-    # If child is deterministic function of parent, MI ≈ log(n_parent_values)
-    # With noise, MI decreases
-    
-    # Use a simple model: child = (parent + offset) % n_child_values with probability p
-    # Otherwise, child is random
+	# Child is a noisy function of parent: deterministic with prob 1 - noise_prob,
+	# random otherwise.
     n_child_values = 20
     
-    # Estimate noise probability from target MI
-    # If deterministic: MI ≈ log2(min(n_parent, n_child))
+	# Estimate noise probability from target MI.
     max_mi = np.log2(min(n_parent_values, n_child_values))
     if mi_target >= max_mi:
         noise_prob = 0.0  # Fully deterministic
@@ -78,23 +53,12 @@ def generate_correlated_data(n_rows: int, mi_target: float, seed: int = 0):
 
 def generate_linear_correlated_data(n_rows: int, correlation: float, seed: int = 0):
     """
-    Generate two linearly correlated numeric columns.
-    
-    Args:
-        n_rows: Number of rows
-        correlation: Pearson correlation coefficient (-1 to 1)
-        seed: Random seed
-    
-    Returns:
-        (parent, child) arrays with specified correlation
+	Generate two numeric columns with the given Pearson correlation coefficient.
     """
     np.random.seed(seed)
     
-    # Generate parent (normal distribution)
     parent = np.random.normal(0, 1, size=n_rows)
     
-    # Generate child with specified correlation
-    # child = correlation * parent + sqrt(1 - correlation^2) * noise
     noise = np.random.normal(0, 1, size=n_rows)
     child = correlation * parent + np.sqrt(1 - correlation**2) * noise
     

@@ -1037,14 +1037,11 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 			if col_unique > threshold:
 				skip_high_card.add(i)
 		profiler["cardinality_check"] = time.time() - stage_start
-		
-		# Build MDL-weighted forest using two-phase approach
-		# The function returns (phase1_edges, refined_edges) for separate timing
-		# We need to time phase1 and phase2 separately, so we'll do it in two calls
-		# Actually, let's refactor to time inside the function or split the phases
-		# For now, let's keep the existing inline code but move the forest building part
-		# Phase 1: Fast ranking with proxy MDL on all edge pairs
-		# For datasets <= 10k rows, can afford to use exact MI throughout for better accuracy
+	
+		# Build MDL-weighted forest using a two-phase procedure.
+		# Phase 1: fast proxy-MDL ranking of all edge pairs.
+		# Phase 2: re-evaluate top candidates with OpenZL MDL and exact MI.
+		# For small datasets we can use exact MI throughout.
 		use_exact_mi_phase1 = (n_rows <= 10000)
 		
 		if mi_sample is None:
@@ -1069,9 +1066,9 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		# For larger datasets, use hashed MI in phase 1 with more buckets, exact in phase 2
 		if mi_mode == "auto":
 			if n_rows <= 10000:
-				phase1_mi_mode = "exact"  # Use exact MI for better accuracy on smaller datasets
+				phase1_mi_mode = "exact"
 			else:
-				phase1_mi_mode = "hashed"  # Use hashed for speed, but with more buckets
+				phase1_mi_mode = "hashed"
 		elif mi_mode == "exact":
 			phase1_mi_mode = "exact"
 		else:
@@ -1176,11 +1173,8 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		all_fast_edges.sort(key=lambda x: x[2], reverse=True)
 		profiler["phase1_mi"] = time.time() - stage_start
 		
-		# Phase 2: Refine top candidates with OpenZL MDL and EXACT MI for accuracy
-		# Use exact MI (not hashed) for final selection - critical for compression ratio
-		# Take more candidates to ensure we don't miss good edges
-		# Scale candidate count with dataset size and number of columns - be extremely aggressive
-		# For large datasets, we can afford to evaluate more edges
+		# Phase 2: Score top candidate edges using OpenZL MDL and exact MI
+		# Use a large number of candidates for thorough final selection
 		max_candidates = min(len(all_fast_edges), max(n_cols * 25, 1500), 3000)  # Top 1500-3000 or 25x columns (extremely aggressive)
 		top_candidates = all_fast_edges[:max_candidates]
 		
@@ -1252,11 +1246,8 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	indices, dicts, rare_blobs, is_numeric = _tokenize_columns(df, rare_threshold=rare_threshold)
 	profiler["tokenize_columns"] = time.time() - stage_start
 	rare_b64 = [base64.b64encode(b).decode("ascii") for b in rare_blobs]
-	# Store is_numeric information in the model (reuse rare_meta structure or add new field)
-	# For now, encode it in the dicts structure: None = numeric, list = categorical
-	# Store delimiter so we can output CSV with correct separator
-	# Normalize delimiter before storing: convert "\\t" to '\t' (tab character)
-	# This ensures it's stored as a single character and works correctly in to_csv()
+	# Track which columns are numeric via the dicts list (None = numeric, list = categorical).
+	# Save the delimiter (convert '\\t' and '\\n' to real tab/newline before storing) so CSV output works as expected.
 	normalized_delimiter = delimiter
 	if delimiter == '\\t':
 		normalized_delimiter = '\t'
@@ -1527,10 +1518,10 @@ def decompress_file(input_path: str, output_path: str) -> None:
 				reconstructed = []
 				for x in ids.tolist():
 					val = float(x) / scale
-					if scale == 1:
+				if scale == 1:
 						# Pure integers - check if we need to preserve .0 format
 						reconstructed.append(str(int(val)))
-					else:
+				else:
 						reconstructed.append(str(val))
 				
 				# Apply format preservation from rare_meta if available
@@ -1685,10 +1676,7 @@ def decompress_file(input_path: str, output_path: str) -> None:
 	df = df.replace('nan', EMPTY_STRING)
 	df = df.replace('None', EMPTY_STRING)
 	
-	# Write CSV exactly as input: use stored delimiter, no header, no index
-	# Use stored line ending style to preserve original format (CRLF vs LF)
-	# Get delimiter from model (always present, defaults to comma for backward compatibility)
-	# Normalize delimiter: convert "\\t" to '\t' (tab character)
+	# Write CSV using original delimiter/line ending from model, no header or index
 	delimiter = model.delimiter
 	if delimiter == '\\t':
 		delimiter = '\t'

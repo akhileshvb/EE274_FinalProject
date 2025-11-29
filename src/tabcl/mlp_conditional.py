@@ -1,10 +1,4 @@
-"""
-MLP-based conditional encoding for tabular compression.
-
-Implements encoding and decoding of columns using tiny MLP models
-instead of histogram-based conditional compression when MDL indicates
-it's beneficial.
-"""
+"""MLP-based conditional encoding and decoding of columns."""
 
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
@@ -33,26 +27,15 @@ def encode_column_with_mlp(
 	child_indices: np.ndarray,
 	parent_indices: np.ndarray,
 	dicts: Any,
-	embedding_dim: int = 8,  # Reduced for smaller model cost
-	hidden_dims: List[int] = [32],  # Reduced for smaller model cost
-	num_epochs: int = 20,  # More epochs for better learning despite smaller model
+	embedding_dim: int = 8,
+	hidden_dims: List[int] = [32],
+	num_epochs: int = 20,
 	max_samples: Optional[int] = 50000,
 ) -> Tuple[Optional[bytes], Optional[TinyMLP], float]:
-	"""
-	Encode a child column using MLP-based conditional compression.
-	
-	Args:
-		child_indices: Child column indices [n_rows]
-		parent_indices: Parent column indices [n_rows]
-		dicts: Dictionary/token mapping for child column (for compatibility)
-		embedding_dim: Embedding dimension for parent
-		hidden_dims: Hidden layer dimensions
-		num_epochs: Number of training epochs
-		max_samples: Maximum samples for training
-	
-	Returns:
-		(encoded_data_bytes, model, total_bits)
-		If encoding fails or is not beneficial, returns (None, None, inf)
+	"""Encode a child column using an MLP conditional model.
+
+	Returns (encoded_bytes, model, total_bits). If the MLP is not usable or not
+	beneficial, returns (None, None, inf).
 	"""
 	if not TORCH_AVAILABLE or zl is None:
 		return None, None, float('inf')
@@ -65,9 +48,6 @@ def encode_column_with_mlp(
 	# Remove -1 if it's present (it's a sentinel value, not a real data value)
 	all_unique_children = all_unique_children[all_unique_children != -1]
 	all_unique_parents = all_unique_parents[all_unique_parents != -1]
-	
-	# Note: -1 is a sentinel value used elsewhere in the codebase (e.g., for missing parents)
-	# It will be filtered out during training, and rows with -1 will be skipped
 	
 	# Train MLP
 	model = train_tiny_mlp(
@@ -95,10 +75,6 @@ def encode_column_with_mlp(
 		max_samples=None,  # Use all data for final encoding
 	)
 	
-	# NEW STRATEGY: Residual-based encoding using MLP predictions
-	# The key insight: if MLP predicts well, residuals (actual - predicted) will be small
-	# We encode residuals instead of raw values, which should compress much better
-	
 	# Get predictions for all rows
 	device = next(model.parameters()).device
 	parent_mapped = np.array([
@@ -113,14 +89,12 @@ def encode_column_with_mlp(
 		probs_np = probs.cpu().numpy()
 		predicted_classes = np.argmax(probs_np, axis=1)
 	
-	# Map child indices to model's child_map space for comparison
-	# The model's child_map should now include all unique values from the full dataset
-	# Handle -1 (sentinel value) specially - it shouldn't be in child_map
+	# Map child indices to the model's child_map space
 	child_mapped = np.array([
 		model.child_map.get(v, -1) if v != -1 else -1 for v in child_indices
 	], dtype=np.int64)
 	
-	# Check if we have any unmapped values (shouldn't happen if all_unique_children was passed correctly)
+	# If there are unmapped values, something went wrong with the mapping:
 	unmapped_mask = (child_mapped == -1) & (child_indices != -1)
 	if np.any(unmapped_mask):
 		unmapped_count = np.sum(unmapped_mask)
@@ -130,41 +104,30 @@ def encode_column_with_mlp(
 			f"This means all_unique_children was incomplete or the model's child_map is missing values."
 		)
 	
-	# For rows where child_indices == -1 (sentinel), we can't use MLP encoding
-	# Skip MLP encoding for this column if there are too many -1 values
+	# For rows where child_indices == -1 (sentinel), skip MLP if they are too frequent.
 	if np.any(child_indices == -1):
 		sentinel_count = np.sum(child_indices == -1)
 		if sentinel_count > len(child_indices) * 0.1:  # More than 10% are sentinels
 			# Too many sentinels - MLP won't work well
 			return None, None, float('inf')
-		# For sentinel values, we'll use a special encoding (encode them as a separate stream)
-		# For now, let's just skip MLP if there are any sentinels
-		# TODO: Handle sentinels properly
 		return None, None, float('inf')
 	
 	# Compute residuals: actual_class - predicted_class
-	# When MLP predicts correctly, residual = 0 (very compressible!)
 	residuals = child_mapped.astype(np.int64) - predicted_classes.astype(np.int64)
 	
 	# Ensure all values are in valid range (safety check)
 	child_mapped = np.clip(child_mapped, 0, model.num_classes - 1)
 	predicted_classes = np.clip(predicted_classes, 0, model.num_classes - 1)
 	
-	# However, we need to handle the case where predicted class might be out of bounds
-	# or where the mapping doesn't match. For now, we'll encode residuals directly.
-	# Residuals should be small when MLP is accurate, making them highly compressible.
-	
-	# Compress residuals using OpenZL - residuals should be small integers
+	# Compress residuals using the numeric codec; residuals should be small integers.
 	from .codec import compress_numeric_array_fast
 	try:
-		# Try delta encoding first (works great for small integers)
 		residuals_compressed = compress_numeric_array_fast(
 			residuals.astype(np.int64),
 			use_ace=False,
 			prefer_delta=True
 		)
 	except Exception:
-		# Fallback: try generic compression
 		try:
 			residuals_compressed = compress_numeric_array_fast(
 				residuals.astype(np.int64),
@@ -172,15 +135,8 @@ def encode_column_with_mlp(
 				prefer_delta=False
 			)
 		except Exception:
-			# Last resort: raw bytes
 			residuals_compressed = residuals.astype(np.int64).tobytes()
 	
-	# We also need to store a mapping from model's child_map back to original indices
-	# But wait - the decoder can reconstruct this from the model's inverse_child_map
-	# So we just need to ensure the model has the inverse map (which it should)
-	
-	# The encoded data is just the compressed residuals
-	# Decoder will: 1) Get predictions from MLP, 2) Decode residuals, 3) Reconstruct actual = predicted + residual
 	combined = residuals_compressed
 	
 	# Total cost = model cost + compressed residuals cost

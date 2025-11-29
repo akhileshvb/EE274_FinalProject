@@ -10,7 +10,7 @@ except ImportError:
     print("Error: matplotlib, networkx, and numpy are required. Install with: pip install matplotlib networkx numpy", file=sys.stderr)
     sys.exit(1)
 
-# Add parent directory to path to import tabcl
+# Add parent directory to path to import tabcl.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.tabcl.cli import Model
 
@@ -18,17 +18,7 @@ from src.tabcl.cli import Model
 def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "spring", 
                      show_labels: bool = True, show_weights: bool = True, 
                      col_names: bool = True, highlight_connected: bool = True):
-    """
-    Visualize the forest structure from a .tabcl file.
-    
-    Args:
-        tabcl_file: Path to the .tabcl file
-        output_file: Path to save the visualization (if None, displays interactively)
-        layout: Graph layout algorithm ('spring', 'circular', 'hierarchical', 'kamada_kawai')
-        show_labels: Whether to show node labels
-        show_weights: Whether to show edge weights as edge width
-        col_names: Whether to use column names from model (if available) instead of C0, C1, etc.
-    """
+    """Visualize the forest structure stored in a .tabcl file."""
     if not tabcl_file.exists():
         print(f"Error: {tabcl_file} not found", file=sys.stderr)
         sys.exit(1)
@@ -46,13 +36,12 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         print(f"Error: Could not load model from {tabcl_file}: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Create directed graph to show parent->child relationships (learned tree structure)
+    # Directed graph: parent -> child.
     G = nx.DiGraph()
     n_cols = len(model.columns)
     G.add_nodes_from(range(n_cols))
     
-    # Add edges based on parent relationships (this shows the learned tree structure)
-    # Each edge goes from parent to child
+    # Add edges based on parent relationships.
     for child_idx, parent_idx in enumerate(model.parents):
         if parent_idx >= 0:  # Has a parent
             # Find the edge weight from model.edges
@@ -65,7 +54,7 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
                         break
             G.add_edge(parent_idx, child_idx, weight=weight)
     
-    # Also add edges from model.edges for visualization (in case some are missing from parents)
+    # Also add edges from model.edges for completeness.
     for edge in model.edges:
         if len(edge) >= 3:
             u, v, w = int(edge[0]), int(edge[1]), float(edge[2])
@@ -80,7 +69,7 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
     if len(G.edges()) == 0:
         print("Warning: No edges found in forest (all columns are independent)", file=sys.stderr)
     
-    # Create figure - use larger size for dense graphs
+    # Figure size scales with number of nodes.
     n_nodes = len(G.nodes())
     if n_nodes > 30:
         figsize = (18, 14)
@@ -90,11 +79,9 @@ def visualize_forest(tabcl_file: Path, output_file: Path = None, layout: str = "
         figsize = (14, 10)
     fig, ax = plt.subplots(figsize=figsize)
     
-    # Choose layout with better spacing for dense graphs
-    # For directed graphs, convert to undirected for layout computation
+    # Layout is computed on an undirected copy.
     G_layout = G.to_undirected() if isinstance(G, nx.DiGraph) else G
     if layout == "spring":
-        # Increase k (optimal distance) for better spacing in dense graphs
         k = max(3.0, np.sqrt(n_nodes) * 0.8) if n_nodes > 20 else 2.0
         pos = nx.spring_layout(G_layout, k=k, iterations=100, seed=42)
     elif layout == "circular":

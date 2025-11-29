@@ -13,8 +13,9 @@ from .codec import (
 def _encode_varint(value: int, signed: bool = False) -> bytes:
 	"""
 	Encode an integer as a variable-length byte sequence.
-	Format: 7 bits per byte, MSB indicates continuation (1=more bytes, 0=last byte)
-	If signed=True, uses zigzag encoding to support negative values.
+
+	Uses 7 data bits per byte with the MSB as the continuation flag. If
+	``signed`` is True, values are zigzag-encoded first.
 	"""
 	if not signed and value < 0:
 		raise ValueError("Varint encoding only supports non-negative integers when signed=False")

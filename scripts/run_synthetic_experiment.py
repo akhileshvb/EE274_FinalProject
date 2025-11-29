@@ -170,7 +170,7 @@ def plot_results(results_file: Path, output_file: Path = None):
     
     # Create figure
     fig, ax = plt.subplots(1, 1, figsize=(12, 7))
-    fig.suptitle('Compression Ratio vs Correlation Strength', fontsize=16, fontweight='bold')
+    fig.suptitle('Compression Ratio vs Correlation Strength', fontsize=20, fontweight='bold')
     
     methods = [
         ('tabcl_ratio', 'tabcl (learned tree)', 'steelblue', 'o-', 2.5),
@@ -186,9 +186,10 @@ def plot_results(results_file: Path, output_file: Path = None):
                 ax.plot(valid_data['correlation_strength'], valid_data[col], 
                         style, label=label, color=color, linewidth=linewidth, markersize=7)
     
-    ax.set_xlabel('Correlation Strength', fontsize=13)
-    ax.set_ylabel('Compression Ratio', fontsize=13)
-    ax.legend(loc='best', fontsize=11)
+    ax.set_xlabel('Correlation Strength', fontsize=18, fontweight='bold')
+    ax.set_ylabel('Compression Ratio', fontsize=18, fontweight='bold')
+    ax.legend(loc='best', fontsize=16)
+    ax.tick_params(axis='both', labelsize=16)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([df['correlation_strength'].min() - 0.05, df['correlation_strength'].max() + 0.05])
     
@@ -264,46 +265,34 @@ Examples:
     print(f"  Seed: {args.seed}")
     print()
     
-    # Generate correlation levels with more granularity between 0.8 and 1.0
-    # Especially fine-grained near 1.0 to capture where tabcl might overtake zstd
+    # Generate correlation levels with extra resolution near 1.0.
     if args.n_levels == 1:
         correlation_levels = [args.corr_min]
     else:
-        # Create multiple ranges: regular spacing for low range, finer for 0.8-0.95, very fine for 0.95-1.0
         if args.corr_max >= 0.8 and args.corr_min <= 0.8:
-            # Split into three ranges for better granularity
-            # Range 1: from corr_min to 0.8 (use 50% of points)
             n_points_low = max(2, int(args.n_levels * 0.5))
             if args.corr_min < 0.8:
                 low_range = np.linspace(args.corr_min, 0.8, n_points_low, endpoint=False)
             else:
                 low_range = np.array([])
             
-            # Range 2: from 0.8 to 0.95 (use 30% of points)
             n_points_mid = max(3, int(args.n_levels * 0.3))
             mid_range = np.linspace(0.8, 0.95, n_points_mid, endpoint=False)
             
-            # Range 3: from 0.95 to corr_max (use remaining points, but at least 6 for very fine granularity)
             n_points_high = max(6, args.n_levels - len(low_range) - len(mid_range))
-            # Use logarithmic spacing near 1.0 for even finer granularity
             if args.corr_max >= 0.95:
-                # Create points that are more dense near 1.0
-                # Use a transformation: map uniform spacing to exponential spacing near 1.0
                 uniform_spacing = np.linspace(0, 1, n_points_high)
-                # Transform to get more points near 1.0: use 1 - exp(-x) mapping
                 high_range = 0.95 + (args.corr_max - 0.95) * (1 - np.exp(-3 * uniform_spacing)) / (1 - np.exp(-3))
                 high_range = np.clip(high_range, 0.95, args.corr_max)
-                # Ensure we have 1.0 if corr_max is 1.0
                 if args.corr_max >= 1.0:
                     high_range[-1] = args.corr_max
             else:
                 high_range = np.linspace(0.95, args.corr_max, n_points_high, endpoint=True)
             
             correlation_levels = np.concatenate([low_range, mid_range, high_range])
-            correlation_levels = np.unique(correlation_levels)  # Remove duplicates
-            correlation_levels = np.sort(correlation_levels)  # Ensure sorted
+            correlation_levels = np.unique(correlation_levels)
+            correlation_levels = np.sort(correlation_levels)
         else:
-            # Regular spacing for the entire range
             correlation_levels = np.linspace(args.corr_min, args.corr_max, args.n_levels)
     
     # Results storage

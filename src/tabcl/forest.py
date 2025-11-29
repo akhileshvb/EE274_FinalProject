@@ -26,8 +26,7 @@ def build_mdl_weighted_forest(
 	G = nx.Graph()
 	G.add_nodes_from(range(n_cols))
 
-	# Skip edges involving very high-cardinality columns (near-unique) - they compress better independently
-	# Use very fast approximation: just check a tiny sample
+	# Skip edges involving very high-cardinality columns (near-unique); they compress better independently.
 	skip_high_card = set()
 	rng = np.random.default_rng(seed)
 	# Use tiny sample for speed - just need to identify obviously high-cardinality columns
@@ -38,10 +37,8 @@ def build_mdl_weighted_forest(
 	else:
 		table_sample = table
 	
-	# Quick cardinality check - skip high-cardinality columns early
-	# Use approximation: if even a small sample has high uniqueness, skip the column
-	# NOTE: For numeric/float columns, high cardinality is expected (continuous data),
-	# so we should NOT skip them. Only skip high-cardinality categorical/string columns.
+	# Quick cardinality check on a small sample. We only skip high-cardinality
+	# categorical/string columns; high-cardinality numeric columns are kept.
 	for i in range(n_cols):
 		col_data = table_sample[:, i]
 		# Check if column is numeric - if so, don't skip based on cardinality
@@ -63,7 +60,7 @@ def build_mdl_weighted_forest(
 		except:
 			pass
 		
-		# Only check cardinality for non-numeric columns
+		# Only check cardinality for non-numeric columns.
 		if not is_numeric:
 			try:
 				col_unique = len(np.unique(col_data))
@@ -92,10 +89,8 @@ def build_mdl_weighted_forest(
 			if i not in skip_high_card and j not in skip_high_card:
 				edge_pairs.append((i, j))
 	
-	# Create a wrapper that passes sampling parameters to mdl_cost_fn if it accepts them
 	def mdl_cost_wrapper(x, y, mdl_sample_size: Optional[int] = None):
-		"""Use smaller sample for MDL cost to speed up computation."""
-		# Use smaller sample for MDL cost estimation (it's just for ranking edges)
+		"""MDL cost with an optional smaller sample for speed."""
 		effective_mdl_sample = mdl_sample_size or (row_sample // 2 if row_sample else None)
 		try:
 			sig = inspect.signature(mdl_cost_fn)
@@ -107,9 +102,9 @@ def build_mdl_weighted_forest(
 		return mdl_cost_fn(x, y)
 	
 	def compute_edge_weight(i: int, j: int) -> Tuple[int, int, float]:
-		"""Compute edge weight for a single pair of columns."""
+		"""Compute MDL-weighted edge score for a single pair of columns."""
 		x, y = table[:, i], table[:, j]
-		# Use moderate samples for speed - balance accuracy and performance
+		# Use moderate samples for speed.
 		if n_rows > 100_000:
 			mdl_sample = min(row_sample or 5000, n_rows, 5000)
 		elif n_rows > 10_000:
@@ -127,12 +122,11 @@ def build_mdl_weighted_forest(
 			w = estimate_edge_weight(n_rows, x, y, mdl_bits)
 		return (i, j, w)
 	
-	# Parallelize edge weight computation - always use parallel for speed
+	# Parallelize edge weight computation when there is enough work.
 	import os
 	max_workers = min(len(edge_pairs), int(os.cpu_count() or 4), 16)  # Cap at 16 to avoid overhead
 	
 	if max_workers > 1 and len(edge_pairs) > 1:
-		# Use parallel computation - always parallelize for speed
 		with ThreadPoolExecutor(max_workers=max_workers) as executor:
 			futures = {executor.submit(compute_edge_weight, i, j): (i, j) for i, j in edge_pairs}
 			for future in as_completed(futures):

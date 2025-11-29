@@ -1,11 +1,4 @@
-"""
-Neural compression for tabular data using MLPs with optimal parent selection.
-
-This approach uses:
-1. Forest-based parent selection (like histogram approach) using MI
-2. MLP-based conditional probability estimation (better than histograms)
-3. Probability-weighted encoding using MLP predictions
-"""
+"""Experimental neural compressor for tabular data using MLPs."""
 
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
@@ -31,11 +24,7 @@ from .codec import mdl_cost_fn_fast, mdl_cost_fn_openzl
 
 
 class NeuralForestCompressor:
-    """
-    Neural compressor that uses MLPs to predict conditional probabilities
-    and encodes using probability-weighted approaches for better compression.
-    """
-    
+    """Compressor that replaces some histogram models with TinyMLP predictors."""
     def __init__(
         self,
         embedding_dim: int = 8,
