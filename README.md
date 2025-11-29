@@ -9,14 +9,14 @@ This repository implements the core ideas of “Compressing Tabular Data via Pai
 ## Quickstart
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+conda create -n tabcl python=3.11
+conda activate tabcl
 pip install -U pip
 pip install -r requirements.txt
 pip install -e .
 ```
 
-If you built OpenZL from source, make sure this works inside your virtualenv:
+If you built OpenZL from source, make sure this works inside the `tabcl` environment:
 
 ```python
 >>> import openzl.ext as zl
