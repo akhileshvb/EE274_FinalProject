@@ -22,7 +22,23 @@ def human(n: int) -> str:
 		return f"{n / (1024 * 1024 * 1024 * 1024):.1f} TB"
 
 
-def run(cmd: list[str]) -> float:
+def throughput(original_size: int, time_taken: float | None) -> str:
+	"""Calculate and format throughput (original input bytes / time) in MB/s.
+	This shows how much input data can be processed per second."""
+	if time_taken is None or time_taken <= 0:
+		return "-"
+	throughput_mbps = (original_size / time_taken) / (1024 * 1024)  # MB/s
+	if throughput_mbps < 0.1:
+		throughput_kbps = (original_size / time_taken) / 1024  # KB/s
+		return f"{throughput_kbps:.2f} KB/s"
+	elif throughput_mbps < 1000:
+		return f"{throughput_mbps:.2f} MB/s"
+	else:
+		throughput_gbps = throughput_mbps / 1024  # GB/s
+		return f"{throughput_gbps:.2f} GB/s"
+
+
+def run(cmd: list[str], parse_profiler: bool = False) -> float:
 	"""
 	Run a command and return the elapsed time in seconds.
 	This measures the full time including I/O (reading input, writing output).
@@ -30,10 +46,40 @@ def run(cmd: list[str]) -> float:
 	- Reading the input file
 	- Compression computation
 	- Writing the output file
+	
+	If parse_profiler is True, tries to parse the "Total time" from profiler output
+	and use that instead of wall-clock time.
 	"""
 	start = time.perf_counter()
-	subprocess.run(cmd, check=True)
-	return time.perf_counter() - start
+	if parse_profiler:
+		# Capture output to parse profiler time, but also print it
+		result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+		# Print the output so user still sees it
+		if result.stdout:
+			print(result.stdout, end='')
+		if result.stderr:
+			print(result.stderr, end='', file=sys.stderr)
+		wall_time = time.perf_counter() - start
+		
+		# Check if command failed
+		if result.returncode != 0:
+			# Command failed - raise error with stderr info
+			error_msg = f"Command failed with exit code {result.returncode}"
+			if result.stderr:
+				error_msg += f": {result.stderr[:500]}"
+			raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+		
+		# Try to parse profiler output for "Total time"
+		import re
+		# Look for "Total time: X.XXXs" in the output (check both stdout and stderr)
+		output = result.stdout + result.stderr
+		match = re.search(r'Total time:\s+([\d.]+)s', output)
+		if match:
+			return float(match.group(1))
+		return wall_time
+	else:
+		subprocess.run(cmd, check=True)
+		return time.perf_counter() - start
 
 
 def main() -> None:
@@ -71,6 +117,8 @@ def main() -> None:
 				mi_sample = 20000  # Sample 20k rows for medium files
 			elif orig_size > 1_000_000:  # >1MB
 				mi_sample = 10000  # Sample 10k rows for smaller large files
+		else:
+			mi_mode = "exact"  # For small files, use exact
 
 	# tabcl
 	tabcl_out = outdir / (inp.name + ".tabcl")
@@ -90,7 +138,7 @@ def main() -> None:
 		workers = os.cpu_count() or 4
 	if workers and workers > 0:
 		tabcl_cmd.extend(["--workers", str(workers)])
-	tabcl_time = run(tabcl_cmd)
+	tabcl_time = run(tabcl_cmd, parse_profiler=True)
 	tabcl_size = tabcl_out.stat().st_size
 	
 	# tabcl with line graph baseline (sequential chain instead of learned tree)
@@ -102,7 +150,7 @@ def main() -> None:
 		tabcl_line_cmd.extend(["--mi-sample", str(mi_sample)])
 	if workers and workers > 0:
 		tabcl_line_cmd.extend(["--workers", str(workers)])
-	tabcl_line_time = run(tabcl_line_cmd)
+	tabcl_line_time = run(tabcl_line_cmd, parse_profiler=True)
 	tabcl_line_size = tabcl_line_out.stat().st_size
 	
 	# tabcl + zstd (compress tabcl output with zstd)
@@ -277,41 +325,50 @@ def main() -> None:
 	print("tabcl:")
 	print(f"  size:  {human(tabcl_size)}  (ratio {ratio(tabcl_size)})")
 	print(f"  time:  {tabcl_time:.3f}s")
+	print(f"  throughput:  {throughput(orig_size, tabcl_time)}")
 	print("tabcl (line graph):")
 	print(f"  size:  {human(tabcl_line_size)}  (ratio {ratio(tabcl_line_size)})")
 	print(f"  time:  {tabcl_line_time:.3f}s")
+	print(f"  throughput:  {throughput(orig_size, tabcl_line_time)}")
 	if tabcl_zstd_size is not None:
+		tabcl_zstd_total_time = tabcl_time + tabcl_zstd_time
 		print("tabcl + zstd:")
 		print(f"  size:  {human(tabcl_zstd_size)}  (ratio {ratio(tabcl_zstd_size)})")
-		print(f"  time:  {tabcl_time + tabcl_zstd_time:.3f}s (tabcl: {tabcl_time:.3f}s + zstd: {tabcl_zstd_time:.3f}s, level {args.zstd_level})")
+		print(f"  time:  {tabcl_zstd_total_time:.3f}s (tabcl: {tabcl_time:.3f}s + zstd: {tabcl_zstd_time:.3f}s, level {args.zstd_level})")
+		print(f"  throughput:  {throughput(orig_size, tabcl_zstd_total_time)}")
 	if gzip_size is not None:
 		print("gzip:")
 		print(f"  size:  {human(gzip_size)}  (ratio {ratio(gzip_size)})")
 		print(f"  time:  {gzip_time:.3f}s")
+		print(f"  throughput:  {throughput(orig_size, gzip_time)}")
 	else:
 		print("gzip: not found on PATH")
 	if zstd_size is not None:
 		print("zstd:")
 		print(f"  size:  {human(zstd_size)}  (ratio {ratio(zstd_size)})")
 		print(f"  time:  {zstd_time:.3f}s (level {args.zstd_level})")
+		print(f"  throughput:  {throughput(orig_size, zstd_time)}")
 	else:
 		print("zstd: not found on PATH")
 	if bzip2_size is not None:
 		print("bzip2:")
 		print(f"  size:  {human(bzip2_size)}  (ratio {ratio(bzip2_size)})")
 		print(f"  time:  {bzip2_time:.3f}s")
+		print(f"  throughput:  {throughput(orig_size, bzip2_time)}")
 	else:
 		print("bzip2: not found on PATH")
 	if colgzip_size is not None:
 		print("columnar gzip:")
 		print(f"  size:  {human(colgzip_size)}  (ratio {ratio(colgzip_size)})")
 		print(f"  time:  {colgzip_time:.3f}s")
+		print(f"  throughput:  {throughput(orig_size, colgzip_time)}")
 	else:
 		print("columnar gzip: not available")
 	if colzstd_size is not None:
 		print("columnar zstd:")
 		print(f"  size:  {human(colzstd_size)}  (ratio {ratio(colzstd_size)})")
 		print(f"  time:  {colzstd_time:.3f}s (level {args.zstd_level})")
+		print(f"  throughput:  {throughput(orig_size, colzstd_time)}")
 	else:
 		print("columnar zstd: not available")
 

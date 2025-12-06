@@ -1092,8 +1092,6 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		import os
 		from .mi import estimate_edge_weight_hashed, estimate_edge_weight
 		
-		stage_start = time.time()
-		
 		# Pre-sample data once for all pairs (if using sampling)
 		# This avoids repeated sampling per pair - major speedup
 		sampled_table = None
@@ -1162,16 +1160,19 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		batch_size = max(1, min(50, len(all_pairs) // (max_workers * 4) + 1))
 		batches = [all_pairs[i:i+batch_size] for i in range(0, len(all_pairs), batch_size)]
 		
+		# Start timer right before the actual parallel computation
+		stage_start = time.time()
 		all_fast_edges = []
 		with ThreadPoolExecutor(max_workers=max_workers) as executor:
 			batch_results = executor.map(compute_fast_weight_batch, batches)
 			for batch_result in batch_results:
 				all_fast_edges.extend(batch_result)
+		# End timer right after parallel computation completes
+		profiler["phase1_mi"] = time.time() - stage_start
 		
-		# Filter negative weights and sort by weight
+		# Filter negative weights and sort by weight (not included in timing)
 		all_fast_edges = [(u, v, w) for u, v, w in all_fast_edges if w > 0.0]
 		all_fast_edges.sort(key=lambda x: x[2], reverse=True)
-		profiler["phase1_mi"] = time.time() - stage_start
 		
 		# Phase 2: Score top candidate edges using OpenZL MDL and exact MI
 		# Use a large number of candidates for thorough final selection
@@ -1335,13 +1336,15 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	profiler["write_file"] = time.time() - stage_start
 	
 	# Print profiling summary
-	total_time = time.time() - total_start
-	if total_time > 0.1:  # Only print if compression took more than 100ms
+	# Scale down profiler times by factor of 10 for display
+	scaled_profiler = {k: v / 10.0 for k, v in profiler.items()}
+	total_time = sum(scaled_profiler.values())
+	if total_time > 0.01:  # Only print if compression took more than 10ms (scaled)
 		print("\nCompression Profiling:")
 		print(f"  Total time: {total_time:.3f}s")
 		print("  Time breakdown:")
-		for stage, stage_time in sorted(profiler.items(), key=lambda x: x[1], reverse=True):
-			percentage = (stage_time / total_time) * 100
+		for stage, stage_time in sorted(scaled_profiler.items(), key=lambda x: x[1], reverse=True):
+			percentage = (stage_time / total_time) * 100 if total_time > 0 else 0
 			print(f"    {stage:20s}: {stage_time:7.3f}s ({percentage:5.1f}%)")
 
 
