@@ -1,5 +1,3 @@
-"""Fully autoregressive MLP-based compression: p(x_j | x_<j) for all previous columns."""
-
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import struct

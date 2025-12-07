@@ -8,16 +8,10 @@ import struct
 import json
 from collections import Counter
 
-try:
-	import torch
-	import torch.nn as nn
-	import torch.optim as optim
-	TORCH_AVAILABLE = True
-except ImportError:
-	TORCH_AVAILABLE = False
-	torch = None
-	nn = None
-	optim = None
+import torch
+import torch.nn as nn
+import torch.optim as optim
+TORCH_AVAILABLE = True
 
 
 class TinyMLP(nn.Module):

@@ -6,11 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    print("Error: matplotlib is required. Install with: pip install matplotlib", file=sys.stderr)
-    sys.exit(1)
+import matplotlib.pyplot as plt
 
 
 def generate_correlated_data(n_rows: int, mi_target: float, seed: int = 0):

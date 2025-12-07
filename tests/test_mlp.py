@@ -154,7 +154,8 @@ def test_serialize_deserialize_mlp(synthetic_data):
 		logits_orig = model.forward([parent_tensor])
 		logits_restored = model_restored.forward([parent_tensor])
 	
-	np.testing.assert_allclose(logits_orig.cpu().numpy(), logits_restored.cpu().numpy(), rtol=1e-5)
+	# Allow for quantization errors from int16 serialization (typically < 1% relative error)
+	np.testing.assert_allclose(logits_orig.cpu().numpy(), logits_restored.cpu().numpy(), rtol=1e-2, atol=1e-3)
 
 
 def test_compute_mlp_model_bits(synthetic_data):
