@@ -966,7 +966,7 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 	output_path.write_text(df.to_csv(index=False))
 
 
-def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False, use_line_graph: bool = False, use_mlp_autoregressive: bool = False) -> None:
+def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False, use_line_graph: bool = False, use_mlp_autoregressive: bool = False, show_profiling: bool = False) -> None:
 	import time
 	profiler = {}  # Track time spent in each stage
 	total_start = time.time()
@@ -1349,17 +1349,18 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 			f.write(frame_data)
 	profiler["write_file"] = time.time() - stage_start
 	
-	# Print profiling summary
-	# Scale down profiler times by factor of 10 for display
-	scaled_profiler = {k: v / 10.0 for k, v in profiler.items()}
-	total_time = sum(scaled_profiler.values())
-	if total_time > 0.01:  # Only print if compression took more than 10ms (scaled)
-		print("\nCompression Profiling:")
-		print(f"  Total time: {total_time:.3f}s")
-		print("  Time breakdown:")
-		for stage, stage_time in sorted(scaled_profiler.items(), key=lambda x: x[1], reverse=True):
-			percentage = (stage_time / total_time) * 100 if total_time > 0 else 0
-			print(f"    {stage:20s}: {stage_time:7.3f}s ({percentage:5.1f}%)")
+	# Print profiling summary (only if requested)
+	if show_profiling:
+		# Scale down profiler times by factor of 10 for display
+		scaled_profiler = {k: v / 10.0 for k, v in profiler.items()}
+		total_time = sum(scaled_profiler.values())
+		if total_time > 0.01:  # Only print if compression took more than 10ms (scaled)
+			print("\nCompression Profiling:")
+			print(f"  Total time: {total_time:.3f}s")
+			print("  Time breakdown:")
+			for stage, stage_time in sorted(scaled_profiler.items(), key=lambda x: x[1], reverse=True):
+				percentage = (stage_time / total_time) * 100 if total_time > 0 else 0
+				print(f"    {stage:20s}: {stage_time:7.3f}s ({percentage:5.1f}%)")
 
 
 def decompress_file(input_path: str, output_path: str) -> None:
@@ -1743,6 +1744,7 @@ def main() -> None:
 	pc.add_argument("--use-mlp-autoregressive", action="store_true", help="Use fully autoregressive MLP: p(x_j | x_<j) for all previous columns")
 	pc.add_argument("--use-neural", action="store_true", help="Use neural autoregressive compression (fully ML-based)")
 	pc.add_argument("--use-line-graph", action="store_true", help="Use line graph baseline (sequential chain) instead of learned tree")
+	pc.add_argument("--profile", action="store_true", help="Show compression profiling information")
 
 	pdcp = sub.add_parser("decompress", help="Decompress to CSV")
 	pdcp.add_argument("--input", required=True)
@@ -1753,7 +1755,7 @@ def main() -> None:
 	if args.cmd == "prepare":
 		_prepare_raw_to_csv(Path(args.input), Path(args.output), header=args.has_header)
 	elif args.cmd == "compress":
-		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural, use_line_graph=args.use_line_graph, use_mlp_autoregressive=args.use_mlp_autoregressive)
+		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural, use_line_graph=args.use_line_graph, use_mlp_autoregressive=args.use_mlp_autoregressive, show_profiling=args.profile)
 	elif args.cmd == "decompress":
 		decompress_file(args.input, args.output)
 	else:

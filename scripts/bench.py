@@ -129,7 +129,7 @@ def main() -> None:
 	old_tabcl = inp.parent / (inp.name + ".tabcl")
 	if old_tabcl.exists() and old_tabcl != tabcl_out:
 		old_tabcl.unlink()
-	tabcl_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold)]
+	tabcl_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold), "--profile"]
 	if mi_sample:
 		tabcl_cmd.extend(["--mi-sample", str(mi_sample)])
 	# Auto-detect workers if not specified
@@ -145,7 +145,7 @@ def main() -> None:
 	tabcl_line_out = outdir / (inp.name + ".tabcl_line")
 	if tabcl_line_out.exists():
 		tabcl_line_out.unlink()
-	tabcl_line_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_line_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold), "--use-line-graph"]
+	tabcl_line_cmd = ["tabcl", "compress", "--input", str(inp), "--output", str(tabcl_line_out), "--delimiter", args.delimiter, "--mi-mode", mi_mode, "--rare-threshold", str(args.rare_threshold), "--use-line-graph", "--profile"]
 	if mi_sample:
 		tabcl_line_cmd.extend(["--mi-sample", str(mi_sample)])
 	if workers and workers > 0:

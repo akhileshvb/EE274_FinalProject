@@ -28,6 +28,7 @@ def run_benchmark(input_file: Path, use_neural: bool = False) -> dict:
 		"compress",
 		"--input", str(input_file),
 		"--output", str(output_file),
+		"--profile",
 	]
 	if use_neural:
 		cmd.append("--use-neural")

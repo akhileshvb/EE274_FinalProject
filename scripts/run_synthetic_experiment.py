@@ -66,7 +66,8 @@ def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",",
                "--output", str(output_file),
                "--delimiter", delimiter,
                "--mi-mode", effective_mi_mode,
-               "--rare-threshold", "1"]
+               "--rare-threshold", "1",
+               "--profile"]
         if workers:
             cmd.extend(["--workers", str(workers)])
         if extra_args:

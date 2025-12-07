@@ -28,6 +28,7 @@ def run_benchmark(input_file: Path, use_mlp: bool = False, use_mlp_autoregressiv
 		"compress",
 		"--input", str(input_file),
 		"--output", str(output_file),
+		"--profile",
 	]
 	if use_mlp_autoregressive:
 		cmd.append("--use-mlp-autoregressive")

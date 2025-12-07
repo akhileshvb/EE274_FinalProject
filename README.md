@@ -3,8 +3,7 @@
 This repository implements the core ideas of “Compressing Tabular Data via Pairwise Dependencies” (DCC 2017) using an MDL‑adjusted Chow–Liu forest, wired to the OpenZL Python API. The main focus is a practical implementation of the MDL criterion and forest learning for CSV files; the more experimental neural/MLP code is included as an optional aside.
 
 - OpenZL repo: [facebook/openzl](https://github.com/facebook/openzl)  
-- OpenZL docs: [openzl.org](https://openzl.org/)  
-- Python quick start: [openzl.org/getting-started/examples/py/quick-start/](https://openzl.org/getting-started/examples/py/quick-start/)
+- OpenZL docs: [openzl.org](https://openzl.org/)
 
 ## Quickstart
 
@@ -41,6 +40,16 @@ By default, `tabcl`:
 3. Encodes root columns independently and child columns conditionally on their parents using histogram- and OpenZL‑based codecs.  
 4. Serializes the model (columns, forest, dictionaries) and per‑column frames into a single `.tabcl` file.
 
+### Example: Compressing US Census 1990 Data
+
+```bash
+# Compress using histogram-based approach (default)
+tabcl compress --input datasets/us_census_data_1990/USCensus1990_sample.csv --output us_census.tabcl --delimiter ,
+
+# Decompress
+tabcl decompress --input us_census.tabcl --output us_census_restored.csv
+```
+
 You can control a few knobs via the CLI, e.g.:
 
 - `--mi-mode {exact,hashed,auto}`: how mutual information is estimated.  
@@ -49,8 +58,46 @@ You can control a few knobs via the CLI, e.g.:
 
 See `scripts/bench.py` for examples of running consistent benchmarks across multiple compressors.
 
-## Optional MLP / Neural Extensions
+## MLP Extensions
 
-The `src/tabcl/tiny_mlp.py`, `src/tabcl/mlp_conditional.py`, and `src/tabcl/neural_compression.py` modules contain an experimental MLP‑based extension that tries to replace some histogram models with small neural networks (TinyMLP). In our experiments this did **not** consistently improve end‑to‑end compression compared to the baseline MDL‑weighted Chow–Liu + histogram approach, so it is not enabled by default and is best viewed as exploratory code.
+The repository includes two MLP-based extensions to the histogram approach:
 
-We keep this code in the repository for completeness and as a starting point for future work on learned tabular compression, but the primary, well‑tested path is the MDL‑adjusted Chow–Liu compressor described above.
+### Conditional MLP (`--use-mlp`)
+
+The conditional MLP extension (`src/tabcl/mlp_conditional.py`) trains a small neural network for each child column to learn conditional distributions `p(child | parent)` instead of using histograms. This can be beneficial when parent columns have high cardinality, as the MLP model cost is fixed while histogram cost scales with the number of parent values.
+
+```bash
+# Compress with conditional MLP
+tabcl compress --input data.csv --output data.tabcl --use-mlp
+```
+
+The MLP extension uses probability-weighted rank encoding: for each row, it sorts child values by MLP-assigned probability and encodes the rank of the actual value. When the MLP assigns high probability to correct values, ranks are small (mostly 0s and 1s) and compress well. The system automatically selects MLP vs histogram for each column based on MDL comparison.
+
+### Autoregressive MLP (`--use-mlp-autoregressive`)
+
+The autoregressive MLP extension (`src/tabcl/mlp_autoregressive.py`) implements fully autoregressive compression: `p(x_j | x_<j)` for all previous columns. This extension is included in the repository but is not discussed in detail in the project report.
+
+```bash
+# Compress with autoregressive MLP
+tabcl compress --input data.csv --output data.tabcl --use-mlp-autoregressive
+```
+
+Note: The autoregressive MLP can be significantly slower than the conditional MLP due to training models for each column with increasing context size.
+
+## Testing
+
+The repository includes a comprehensive test suite covering roundtrip compression, tree recovery, and MLP functionality. Run all tests with:
+
+```bash
+pytest tests/
+```
+
+Or run specific test files:
+
+```bash
+pytest tests/test_roundtrip.py
+pytest tests/test_mlp.py
+pytest tests/test_tree_recovery.py
+```
+
+Tests require PyTorch for MLP-related functionality; if PyTorch is not installed, MLP tests will be skipped automatically.
