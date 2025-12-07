@@ -27,9 +27,9 @@ def encode_column_with_mlp(
 	child_indices: np.ndarray,
 	parent_indices: np.ndarray,
 	dicts: Any,
-	embedding_dim: int = 8,
-	hidden_dims: List[int] = [32],
-	num_epochs: int = 20,
+	embedding_dim: int = 4,  # Smaller default to reduce model cost
+	hidden_dims: List[int] = [16],  # Smaller default to reduce model cost
+	num_epochs: int = 20,  # More epochs for better training
 	max_samples: Optional[int] = 50000,
 ) -> Tuple[Optional[bytes], Optional[TinyMLP], float]:
 	"""Encode a child column using an MLP conditional model.
@@ -67,8 +67,9 @@ def encode_column_with_mlp(
 	# Compute model cost
 	model_bits = compute_mlp_model_bits(model)
 	
-	# Compute data cost (using NLL as approximation)
-	data_bits = compute_mlp_data_bits(
+	# Compute data cost using actual rank encoding (more accurate than NLL)
+	# We'll compute this after encoding, but for now use NLL as approximation
+	data_bits_approx = compute_mlp_data_bits(
 		model,
 		parent_indices,
 		child_indices,
@@ -77,9 +78,12 @@ def encode_column_with_mlp(
 	
 	# Get predictions for all rows
 	device = next(model.parameters()).device
+	# Map parent indices, using 0 as fallback for unmapped values
 	parent_mapped = np.array([
 		model.parent_map.get(v, 0) for v in parent_indices
 	], dtype=np.int64)
+	# Ensure parent_mapped is within valid range
+	parent_mapped = np.clip(parent_mapped, 0, model.embedding_vocab_sizes[0] - 1)
 	parent_tensor = torch.from_numpy(parent_mapped.copy()).long().to(device)
 	
 	model.eval()
@@ -87,6 +91,9 @@ def encode_column_with_mlp(
 		logits = model.forward([parent_tensor])
 		probs = torch.softmax(logits, dim=1)
 		probs_np = probs.cpu().numpy()
+		# Ensure probabilities are valid (should be, but be safe)
+		probs_np = np.clip(probs_np, 1e-10, 1.0)
+		probs_np = probs_np / probs_np.sum(axis=1, keepdims=True)  # Renormalize
 		predicted_classes = np.argmax(probs_np, axis=1)
 	
 	# Map child indices to the model's child_map space
@@ -110,37 +117,64 @@ def encode_column_with_mlp(
 		if sentinel_count > len(child_indices) * 0.1:  # More than 10% are sentinels
 			# Too many sentinels - MLP won't work well
 			return None, None, float('inf')
-		return None, None, float('inf')
 	
-	# Compute residuals: actual_class - predicted_class
-	residuals = child_mapped.astype(np.int64) - predicted_classes.astype(np.int64)
+	# NEW APPROACH: Use probability-weighted rank encoding instead of residuals
+	# This is much more efficient when MLP assigns high probability to correct values
+	# For each row, sort child values by MLP probability (descending) and encode the rank of the actual value
+	# This is much more efficient when MLP assigns high probability to correct values
 	
-	# Ensure all values are in valid range (safety check)
+	# Ensure all values are in valid range
 	child_mapped = np.clip(child_mapped, 0, model.num_classes - 1)
-	predicted_classes = np.clip(predicted_classes, 0, model.num_classes - 1)
 	
-	# Compress residuals using the numeric codec; residuals should be small integers.
+	# Vectorized rank encoding: much faster than per-row loop
+	# For each row, we need to find the rank of child_mapped[row_idx] in the probability-sorted list
+	# Vectorized approach: argsort probabilities (descending) for each row
+	prob_sorted_indices = np.argsort(probs_np, axis=1)[:, ::-1]  # [n_rows, num_classes], sorted descending
+	
+	# Fully vectorized rank computation using advanced indexing
+	# Create a 2D array where ranks[row, child_value] = rank
+	# We can do this by: for each row, create an inverse mapping
+	n_rows = len(child_mapped)
+	ranks = np.zeros(n_rows, dtype=np.int32)
+	
+	# Vectorized: for each row, find the position of child_mapped[row] in prob_sorted_indices[row]
+	# We can use: ranks[row] = position where prob_sorted_indices[row, :] == child_mapped[row]
+	# This is equivalent to: ranks[row] = argwhere(prob_sorted_indices[row] == child_mapped[row])[0]
+	# We can vectorize this by creating a comparison matrix
+	row_indices = np.arange(n_rows)
+	# Create a boolean mask: [n_rows, num_classes] where mask[row, col] = (prob_sorted_indices[row, col] == child_mapped[row])
+	match_matrix = prob_sorted_indices == child_mapped[:, np.newaxis]
+	# Find first match for each row
+	ranks = np.argmax(match_matrix, axis=1).astype(np.int32)
+	# If no match found (shouldn't happen), argmax returns 0, but we want to verify
+	# Check for rows where no match was found
+	no_match_mask = ~np.any(match_matrix, axis=1)
+	ranks[no_match_mask] = model.num_classes - 1  # Fallback for unmapped values
+	
+	# Compress ranks using numeric codec (ranks should be small when MLP is good)
 	from .codec import compress_numeric_array_fast
 	try:
-		residuals_compressed = compress_numeric_array_fast(
-			residuals.astype(np.int64),
-			use_ace=False,
-			prefer_delta=True
+		ranks_compressed = compress_numeric_array_fast(
+			ranks.astype(np.int64),
+			use_ace=True,  # ACE is good for small integers with low entropy
+			prefer_delta=False
 		)
 	except Exception:
 		try:
-			residuals_compressed = compress_numeric_array_fast(
-				residuals.astype(np.int64),
+			ranks_compressed = compress_numeric_array_fast(
+				ranks.astype(np.int64),
 				use_ace=False,
-				prefer_delta=False
+				prefer_delta=True
 			)
 		except Exception:
-			residuals_compressed = residuals.astype(np.int64).tobytes()
+			ranks_compressed = ranks.astype(np.int64).tobytes()
 	
-	combined = residuals_compressed
+	combined = ranks_compressed
 	
-	# Total cost = model cost + compressed residuals cost
-	total_bits = model_bits + len(combined) * 8.0
+	# Total cost = model cost + compressed ranks cost
+	# Use actual compressed size for accurate cost
+	data_bits = len(combined) * 8.0
+	total_bits = model_bits + data_bits
 	
 	return combined, model, total_bits
 
@@ -168,9 +202,12 @@ def decode_column_with_mlp(
 	
 	# Step 1: Reconstruct MLP predictions for all rows
 	device = next(model.parameters()).device
+	# Map parent indices, using 0 as fallback for unmapped values (same as encoding)
 	parent_mapped = np.array([
 		model.parent_map.get(v, 0) for v in parent_indices
 	], dtype=np.int64)
+	# Ensure parent_mapped is within valid range
+	parent_mapped = np.clip(parent_mapped, 0, model.embedding_vocab_sizes[0] - 1)
 	parent_tensor = torch.from_numpy(parent_mapped.copy()).long().to(device)
 	
 	model.eval()
@@ -178,12 +215,14 @@ def decode_column_with_mlp(
 		logits = model.forward([parent_tensor])
 		probs = torch.softmax(logits, dim=1)
 		probs_np = probs.cpu().numpy()
-		predicted_classes = np.argmax(probs_np, axis=1)
+		# Ensure probabilities are valid (should be, but be safe)
+		probs_np = np.clip(probs_np, 1e-10, 1.0)
+		probs_np = probs_np / probs_np.sum(axis=1, keepdims=True)  # Renormalize
 	
-	# Step 2: Decode residuals
+	# Step 2: Decode ranks
 	from .codec import decompress_numeric_array
 	try:
-		residuals = decompress_numeric_array(encoded_data)
+		ranks = decompress_numeric_array(encoded_data)
 	except Exception:
 		# Fallback: try OpenZL decompression
 		if zl is not None:
@@ -192,27 +231,36 @@ def decode_column_with_mlp(
 				outs = dctx.decompress(encoded_data)
 				if len(outs) != 1 or outs[0].type != zl.Type.Numeric:
 					raise RuntimeError("Unexpected OpenZL output")
-				residuals = outs[0].data
+				ranks = outs[0].data
 			except Exception:
 				# Last resort: assume raw bytes
-				residuals = np.frombuffer(encoded_data, dtype=np.int64)
+				ranks = np.frombuffer(encoded_data, dtype=np.int64)
 		else:
-			residuals = np.frombuffer(encoded_data, dtype=np.int64)
+			ranks = np.frombuffer(encoded_data, dtype=np.int64)
 	
-	# Ensure residuals match expected length
-	if len(residuals) != n_rows:
+	# Ensure ranks match expected length
+	if len(ranks) != n_rows:
 		# Pad or truncate if needed (shouldn't happen, but be safe)
-		if len(residuals) < n_rows:
-			residuals = np.pad(residuals, (0, n_rows - len(residuals)), mode='constant')
+		if len(ranks) < n_rows:
+			ranks = np.pad(ranks, (0, n_rows - len(ranks)), mode='constant')
 		else:
-			residuals = residuals[:n_rows]
+			ranks = ranks[:n_rows]
 	
-	# Step 3: Reconstruct actual classes: actual = predicted + residual
-	child_mapped = (predicted_classes.astype(np.int64) + residuals.astype(np.int64)).astype(np.int64)
+	# Step 3: Reconstruct actual classes from ranks using probability distributions
+	# Vectorized decoding: much faster
+	# Sort probabilities for each row (descending) - same as encoding
+	prob_sorted_indices = np.argsort(probs_np, axis=1)[:, ::-1]  # [n_rows, num_classes], sorted descending
 	
-	# Ensure child_mapped values are valid (non-negative and within expected range)
+	# For each row, get the child_value at position ranks[row_idx] in prob_sorted_indices[row_idx]
+	# Clamp ranks to valid range to prevent index errors
+	ranks_clamped = np.clip(ranks, 0, model.num_classes - 1).astype(np.int32)
+	
+	# Use advanced indexing to get child values (fully vectorized)
+	row_indices = np.arange(n_rows)
+	child_mapped = prob_sorted_indices[row_indices, ranks_clamped]
+	
+	# Ensure all decoded values are valid
 	child_mapped = np.clip(child_mapped, 0, model.num_classes - 1)
-	predicted_classes = np.clip(predicted_classes, 0, model.num_classes - 1)
 	
 	# Step 4: Map back to original class indices using inverse_child_map
 	# Always build inverse map from child_map to ensure it's complete
@@ -280,9 +328,9 @@ def compare_mlp_vs_histogram_mdl(
 	parent_indices: np.ndarray,
 	histogram_model_bits: float,
 	histogram_data_bits: float,
-	embedding_dim: int = 6,  # Even smaller to reduce model cost
-	hidden_dims: List[int] = [24],  # Even smaller to reduce model cost
-	num_epochs: int = 25,  # More epochs to compensate for smaller model
+	embedding_dim: int = 4,  # Smaller to reduce model cost
+	hidden_dims: List[int] = [16],  # Smaller to reduce model cost
+	num_epochs: int = 30,  # More epochs for better training
 	max_samples: Optional[int] = 50000,
 	margin: float = 0.0,
 ) -> Tuple[bool, Optional[TinyMLP], float]:

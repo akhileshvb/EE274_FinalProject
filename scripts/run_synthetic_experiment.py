@@ -26,12 +26,14 @@ from scripts.generate_synthetic_mi_data import generate_tree_structured_data
 
 
 def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",", 
-                  zstd_level: int = 19, mi_mode: str = "auto", workers: int = None):
+                  zstd_level: int = 4, mi_mode: str = "auto", workers: int = None):
     """
     Run compression benchmark on a CSV file and return results.
+    Tests: tabcl (histogram), tabcl (MLP conditional), tabcl (line graph),
+           gzip, zstd, bzip2, columnar gzip, columnar zstd.
     
     Returns:
-        Dictionary with compression results (size, time, ratio) for each method
+        Dictionary with compression results (size, time, ratio, throughput) for each method
     """
     results = {}
     
@@ -48,55 +50,63 @@ def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",",
         else:
             effective_mi_mode = "hashed"
     
-    # tabcl (learned tree)
+    import time
+    import shutil
+    import tempfile
+    import pandas as pd
+    
+    # Helper function to run tabcl compression
+    def run_tabcl_compress(csv_file: Path, output_file: Path, extra_args: list = None):
+        """Run tabcl compression and return (time, size) or (None, None) on failure."""
+        if output_file.exists():
+            output_file.unlink()
+        
+        cmd = [sys.executable, "-m", "src.tabcl.cli", "compress",
+               "--input", str(csv_file),
+               "--output", str(output_file),
+               "--delimiter", delimiter,
+               "--mi-mode", effective_mi_mode,
+               "--rare-threshold", "1"]
+        if workers:
+            cmd.extend(["--workers", str(workers)])
+        if extra_args:
+            cmd.extend(extra_args)
+        
+        try:
+            start = time.perf_counter()
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            elapsed = time.perf_counter() - start
+            size = output_file.stat().st_size if output_file.exists() else None
+            return elapsed, size
+        except subprocess.CalledProcessError as e:
+            print(f"  Warning: tabcl compression failed: {e.stderr if e.stderr else 'unknown error'}", file=sys.stderr)
+            return None, None
+    
+    # tabcl (histogram-based, learned tree)
     tabcl_out = outdir / (csv_file.stem + ".tabcl")
-    if tabcl_out.exists():
-        tabcl_out.unlink()
+    tabcl_time, tabcl_size = run_tabcl_compress(csv_file, tabcl_out)
+    results['tabcl_time'] = tabcl_time
+    results['tabcl_size'] = tabcl_size
+    results['tabcl_ratio'] = orig_size / tabcl_size if tabcl_size else None
+    results['tabcl_throughput'] = (orig_size / tabcl_time / (1024 * 1024)) if tabcl_time else None
     
-    tabcl_cmd = ["tabcl", "compress", "--input", str(csv_file), 
-                 "--output", str(tabcl_out), "--delimiter", delimiter,
-                 "--mi-mode", effective_mi_mode, "--rare-threshold", "1"]
-    if workers:
-        tabcl_cmd.extend(["--workers", str(workers)])
-    
-    try:
-        import time
-        start = time.perf_counter()
-        subprocess.run(tabcl_cmd, check=True, capture_output=True)
-        results['tabcl_time'] = time.perf_counter() - start
-        results['tabcl_size'] = tabcl_out.stat().st_size
-        results['tabcl_ratio'] = orig_size / results['tabcl_size']
-    except subprocess.CalledProcessError as e:
-        print(f"  Warning: tabcl compression failed: {e.stderr.decode() if e.stderr else 'unknown error'}", file=sys.stderr)
-        results['tabcl_time'] = None
-        results['tabcl_size'] = None
-        results['tabcl_ratio'] = None
+    # tabcl (MLP conditional)
+    tabcl_mlp_out = outdir / (csv_file.stem + ".tabcl_mlp")
+    tabcl_mlp_time, tabcl_mlp_size = run_tabcl_compress(csv_file, tabcl_mlp_out, ["--use-mlp"])
+    results['tabcl_mlp_time'] = tabcl_mlp_time
+    results['tabcl_mlp_size'] = tabcl_mlp_size
+    results['tabcl_mlp_ratio'] = orig_size / tabcl_mlp_size if tabcl_mlp_size else None
+    results['tabcl_mlp_throughput'] = (orig_size / tabcl_mlp_time / (1024 * 1024)) if tabcl_mlp_time else None
     
     # tabcl (line graph baseline)
     tabcl_line_out = outdir / (csv_file.stem + ".tabcl_line")
-    if tabcl_line_out.exists():
-        tabcl_line_out.unlink()
-    
-    tabcl_line_cmd = ["tabcl", "compress", "--input", str(csv_file),
-                      "--output", str(tabcl_line_out), "--delimiter", delimiter,
-                      "--mi-mode", effective_mi_mode, "--rare-threshold", "1", "--use-line-graph"]
-    if workers:
-        tabcl_line_cmd.extend(["--workers", str(workers)])
-    
-    try:
-        start = time.perf_counter()
-        subprocess.run(tabcl_line_cmd, check=True, capture_output=True)
-        results['tabcl_line_time'] = time.perf_counter() - start
-        results['tabcl_line_size'] = tabcl_line_out.stat().st_size
-        results['tabcl_line_ratio'] = orig_size / results['tabcl_line_size']
-    except subprocess.CalledProcessError as e:
-        print(f"  Warning: tabcl line graph compression failed: {e.stderr.decode() if e.stderr else 'unknown error'}", file=sys.stderr)
-        results['tabcl_line_time'] = None
-        results['tabcl_line_size'] = None
-        results['tabcl_line_ratio'] = None
+    tabcl_line_time, tabcl_line_size = run_tabcl_compress(csv_file, tabcl_line_out, ["--use-line-graph"])
+    results['tabcl_line_time'] = tabcl_line_time
+    results['tabcl_line_size'] = tabcl_line_size
+    results['tabcl_line_ratio'] = orig_size / tabcl_line_size if tabcl_line_size else None
+    results['tabcl_line_throughput'] = (orig_size / tabcl_line_time / (1024 * 1024)) if tabcl_line_time else None
     
     # gzip
-    import shutil
     if shutil.which("gzip"):
         gzip_out = outdir / (csv_file.stem + ".gz")
         if gzip_out.exists():
@@ -104,42 +114,161 @@ def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",",
         try:
             start = time.perf_counter()
             subprocess.run(["gzip", "-kf", str(csv_file)], check=True, capture_output=True)
-            results['gzip_time'] = time.perf_counter() - start
+            gzip_time = time.perf_counter() - start
             produced = csv_file.parent / (csv_file.name + ".gz")
             if produced.exists() and produced != gzip_out:
                 produced.replace(gzip_out)
+            results['gzip_time'] = gzip_time
             results['gzip_size'] = gzip_out.stat().st_size
             results['gzip_ratio'] = orig_size / results['gzip_size']
+            results['gzip_throughput'] = orig_size / gzip_time / (1024 * 1024)
         except subprocess.CalledProcessError:
             results['gzip_time'] = None
             results['gzip_size'] = None
             results['gzip_ratio'] = None
+            results['gzip_throughput'] = None
     else:
         results['gzip_time'] = None
         results['gzip_size'] = None
         results['gzip_ratio'] = None
+        results['gzip_throughput'] = None
     
-    # zstd (raw zstd on original CSV, not tabcl+zstd)
+    # zstd
     if shutil.which("zstd"):
         zstd_out = outdir / (csv_file.stem + ".zst")
         if zstd_out.exists():
             zstd_out.unlink()
         try:
             start = time.perf_counter()
-            # Compress the original CSV file directly with zstd
             subprocess.run(["zstd", "-q", f"-{zstd_level}", "-f", str(csv_file), "-o", str(zstd_out)],
                           check=True, capture_output=True)
-            results['zstd_time'] = time.perf_counter() - start
+            zstd_time = time.perf_counter() - start
+            results['zstd_time'] = zstd_time
             results['zstd_size'] = zstd_out.stat().st_size
             results['zstd_ratio'] = orig_size / results['zstd_size']
+            results['zstd_throughput'] = orig_size / zstd_time / (1024 * 1024)
         except subprocess.CalledProcessError:
             results['zstd_time'] = None
             results['zstd_size'] = None
             results['zstd_ratio'] = None
+            results['zstd_throughput'] = None
     else:
         results['zstd_time'] = None
         results['zstd_size'] = None
         results['zstd_ratio'] = None
+        results['zstd_throughput'] = None
+    
+    # bzip2
+    if shutil.which("bzip2"):
+        bzip2_out = outdir / (csv_file.stem + ".bz2")
+        if bzip2_out.exists():
+            bzip2_out.unlink()
+        try:
+            start = time.perf_counter()
+            subprocess.run(["bzip2", "-kf", str(csv_file)], check=True, capture_output=True)
+            bzip2_time = time.perf_counter() - start
+            produced = csv_file.parent / (csv_file.name + ".bz2")
+            if produced.exists() and produced != bzip2_out:
+                produced.replace(bzip2_out)
+            results['bzip2_time'] = bzip2_time
+            results['bzip2_size'] = bzip2_out.stat().st_size if bzip2_out.exists() else None
+            results['bzip2_ratio'] = orig_size / results['bzip2_size'] if results['bzip2_size'] else None
+            results['bzip2_throughput'] = orig_size / bzip2_time / (1024 * 1024) if results['bzip2_size'] else None
+        except subprocess.CalledProcessError:
+            results['bzip2_time'] = None
+            results['bzip2_size'] = None
+            results['bzip2_ratio'] = None
+            results['bzip2_throughput'] = None
+    else:
+        results['bzip2_time'] = None
+        results['bzip2_size'] = None
+        results['bzip2_ratio'] = None
+        results['bzip2_throughput'] = None
+    
+    # Columnar gzip
+    if shutil.which("gzip"):
+        try:
+            delimiter_char = delimiter
+            if delimiter == '\\t':
+                delimiter_char = '\t'
+            elif delimiter == '\\n':
+                delimiter_char = '\n'
+            
+            import warnings
+            warnings.filterwarnings('ignore', category=pd.errors.ParserWarning)
+            df = pd.read_csv(csv_file, delimiter=delimiter_char, header=None, engine='python', on_bad_lines='skip')
+            
+            start = time.perf_counter()
+            col_sizes = []
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for col_idx, col_name in enumerate(df.columns):
+                    col_file = Path(tmpdir) / f"col_{col_idx}.txt"
+                    col_file.write_text("\n".join(str(v) for v in df[col_name].astype(str)))
+                    col_gz = Path(tmpdir) / f"col_{col_idx}.txt.gz"
+                    subprocess.run(["gzip", "-f", str(col_file)], check=True, capture_output=True)
+                    if col_gz.exists():
+                        col_sizes.append(col_gz.stat().st_size)
+            colgzip_time = time.perf_counter() - start
+            colgzip_size = sum(col_sizes)
+            
+            results['columnar_gzip_time'] = colgzip_time
+            results['columnar_gzip_size'] = colgzip_size
+            results['columnar_gzip_ratio'] = orig_size / colgzip_size if colgzip_size else None
+            results['columnar_gzip_throughput'] = orig_size / colgzip_time / (1024 * 1024) if colgzip_size else None
+        except Exception as e:
+            print(f"  Warning: Columnar gzip failed: {e}", file=sys.stderr)
+            results['columnar_gzip_time'] = None
+            results['columnar_gzip_size'] = None
+            results['columnar_gzip_ratio'] = None
+            results['columnar_gzip_throughput'] = None
+    else:
+        results['columnar_gzip_time'] = None
+        results['columnar_gzip_size'] = None
+        results['columnar_gzip_ratio'] = None
+        results['columnar_gzip_throughput'] = None
+    
+    # Columnar zstd
+    if shutil.which("zstd"):
+        try:
+            delimiter_char = delimiter
+            if delimiter == '\\t':
+                delimiter_char = '\t'
+            elif delimiter == '\\n':
+                delimiter_char = '\n'
+            
+            import warnings
+            warnings.filterwarnings('ignore', category=pd.errors.ParserWarning)
+            df = pd.read_csv(csv_file, delimiter=delimiter_char, header=None, engine='python', on_bad_lines='skip')
+            
+            start = time.perf_counter()
+            col_sizes = []
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for col_idx, col_name in enumerate(df.columns):
+                    col_file = Path(tmpdir) / f"col_{col_idx}.txt"
+                    col_file.write_text("\n".join(str(v) for v in df[col_name].astype(str)))
+                    col_zst = Path(tmpdir) / f"col_{col_idx}.txt.zst"
+                    subprocess.run(["zstd", "-q", f"-{zstd_level}", "-f", str(col_file), "-o", str(col_zst)],
+                                  check=True, capture_output=True)
+                    if col_zst.exists():
+                        col_sizes.append(col_zst.stat().st_size)
+            colzstd_time = time.perf_counter() - start
+            colzstd_size = sum(col_sizes)
+            
+            results['columnar_zstd_time'] = colzstd_time
+            results['columnar_zstd_size'] = colzstd_size
+            results['columnar_zstd_ratio'] = orig_size / colzstd_size if colzstd_size else None
+            results['columnar_zstd_throughput'] = orig_size / colzstd_time / (1024 * 1024) if colzstd_size else None
+        except Exception as e:
+            print(f"  Warning: Columnar zstd failed: {e}", file=sys.stderr)
+            results['columnar_zstd_time'] = None
+            results['columnar_zstd_size'] = None
+            results['columnar_zstd_ratio'] = None
+            results['columnar_zstd_throughput'] = None
+    else:
+        results['columnar_zstd_time'] = None
+        results['columnar_zstd_size'] = None
+        results['columnar_zstd_ratio'] = None
+        results['columnar_zstd_throughput'] = None
     
     return results
 
@@ -173,10 +302,12 @@ def plot_results(results_file: Path, output_file: Path = None):
     fig.suptitle('Compression Ratio vs Correlation Strength', fontsize=20, fontweight='bold')
     
     methods = [
-        ('tabcl_ratio', 'tabcl (learned tree)', 'steelblue', 'o-', 2.5),
+        ('tabcl_ratio', 'tabcl (histogram)', 'steelblue', 'o-', 2.5),
+        ('tabcl_mlp_ratio', 'tabcl (MLP)', 'darkblue', 'o--', 2.5),
         ('tabcl_line_ratio', 'tabcl (line graph)', 'coral', 's--', 2),
         ('gzip_ratio', 'gzip', 'green', '^-', 2),
         ('zstd_ratio', 'zstd', 'purple', 'd-', 2),
+        ('bzip2_ratio', 'bzip2', 'orange', 'v-', 2),
     ]
     
     for col, label, color, style, linewidth in methods:
@@ -225,16 +356,16 @@ Examples:
                        help="Minimum correlation strength (default: 0.0)")
     parser.add_argument("--corr-max", type=float, default=1.0,
                        help="Maximum correlation strength (default: 1.0)")
-    parser.add_argument("--n-rows", type=int, default=10000,
-                       help="Number of rows per dataset (default: 10000)")
+    parser.add_argument("--n-rows", type=int, default=500000,
+                       help="Number of rows per dataset (default: 500000, generates ~MB range files)")
     parser.add_argument("--tree-depth", type=int, default=3,
                        help="Tree depth (default: 3)")
     parser.add_argument("--branches", type=int, default=3,
                        help="Branches per node (default: 3)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed (default: 42)")
-    parser.add_argument("--zstd-level", type=int, default=19,
-                       help="ZSTD compression level (default: 19)")
+    parser.add_argument("--zstd-level", type=int, default=4,
+                       help="ZSTD compression level (default: 4)")
     parser.add_argument("--mi-mode", default="auto", choices=["exact", "hashed", "auto"],
                        help="MI computation mode (default: auto)")
     parser.add_argument("--workers", type=int, default=None,
@@ -334,13 +465,17 @@ Examples:
             
             # Print summary
             if results.get('tabcl_ratio'):
-                print(f"    tabcl: {results['tabcl_ratio']:.2f}x compression")
+                print(f"    tabcl (histogram): {results['tabcl_ratio']:.2f}x compression, {results.get('tabcl_time', 0):.2f}s")
+            if results.get('tabcl_mlp_ratio'):
+                print(f"    tabcl (MLP): {results['tabcl_mlp_ratio']:.2f}x compression, {results.get('tabcl_mlp_time', 0):.2f}s")
             if results.get('tabcl_line_ratio'):
-                print(f"    tabcl (line): {results['tabcl_line_ratio']:.2f}x compression")
+                print(f"    tabcl (line): {results['tabcl_line_ratio']:.2f}x compression, {results.get('tabcl_line_time', 0):.2f}s")
             if results.get('gzip_ratio'):
-                print(f"    gzip: {results['gzip_ratio']:.2f}x compression")
+                print(f"    gzip: {results['gzip_ratio']:.2f}x compression, {results.get('gzip_time', 0):.2f}s")
             if results.get('zstd_ratio'):
-                print(f"    zstd: {results['zstd_ratio']:.2f}x compression")
+                print(f"    zstd: {results['zstd_ratio']:.2f}x compression, {results.get('zstd_time', 0):.2f}s")
+            if results.get('bzip2_ratio'):
+                print(f"    bzip2: {results['bzip2_ratio']:.2f}x compression, {results.get('bzip2_time', 0):.2f}s")
         else:
             print(f"  Skipping benchmarks (--skip-benchmark)")
         
@@ -355,10 +490,14 @@ Examples:
         columns = [
             'correlation_strength', 'n_rows', 'n_columns', 'tree_depth', 'branches',
             'original_size', 'dataset_file',
-            'tabcl_size', 'tabcl_time', 'tabcl_ratio',
-            'tabcl_line_size', 'tabcl_line_time', 'tabcl_line_ratio',
-            'gzip_size', 'gzip_time', 'gzip_ratio',
-            'zstd_size', 'zstd_time', 'zstd_ratio'
+            'tabcl_size', 'tabcl_time', 'tabcl_ratio', 'tabcl_throughput',
+            'tabcl_mlp_size', 'tabcl_mlp_time', 'tabcl_mlp_ratio', 'tabcl_mlp_throughput',
+            'tabcl_line_size', 'tabcl_line_time', 'tabcl_line_ratio', 'tabcl_line_throughput',
+            'gzip_size', 'gzip_time', 'gzip_ratio', 'gzip_throughput',
+            'zstd_size', 'zstd_time', 'zstd_ratio', 'zstd_throughput',
+            'bzip2_size', 'bzip2_time', 'bzip2_ratio', 'bzip2_throughput',
+            'columnar_gzip_size', 'columnar_gzip_time', 'columnar_gzip_ratio', 'columnar_gzip_throughput',
+            'columnar_zstd_size', 'columnar_zstd_time', 'columnar_zstd_ratio', 'columnar_zstd_throughput',
         ]
         
         # Write CSV

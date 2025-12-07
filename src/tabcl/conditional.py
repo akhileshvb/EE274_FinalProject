@@ -535,14 +535,13 @@ def encode_columns_with_parents(indices: List[np.ndarray], parents: List[int], d
 			hist_total_bits = hist_model_bits + hist_data_bits
 			
 			# Compare MLP vs histogram
-			# Use a small negative margin to favor MLP when it's close (helps with learning)
-			# But require it to be at least competitive
+			# Use a more favorable margin since we've improved MLP encoding
 			use_mlp_flag, model, mlp_total = compare_mlp_vs_histogram_mdl(
 				child_indices=arr,
 				parent_indices=parent_ids,
 				histogram_model_bits=hist_model_bits,
 				histogram_data_bits=hist_data_bits,
-				margin=-50.0,  # Small negative margin: prefer MLP if within 50 bits
+				margin=-100.0,  # Favor MLP more aggressively since encoding is better
 			)
 			
 			if use_mlp_flag and model is not None:

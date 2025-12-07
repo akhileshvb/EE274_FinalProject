@@ -31,8 +31,6 @@ def run_benchmark(input_file: Path, use_mlp: bool = False, use_mlp_autoregressiv
 	]
 	if use_mlp_autoregressive:
 		cmd.append("--use-mlp-autoregressive")
-	elif use_mlp_autoregressive:
-		cmd.append("--use-mlp-autoregressive")
 	elif use_mlp:
 		cmd.append("--use-mlp")
 	
@@ -138,6 +136,100 @@ def format_size(size_bytes: int) -> str:
 	return f"{size_bytes:.1f} TB"
 
 
+def benchmark_file(input_file: Path, use_mlp: bool = False, use_mlp_autoregressive: bool = False, verbose: bool = True) -> dict:
+	"""
+	Benchmark a single file and return results as a dictionary.
+	
+	Args:
+		input_file: Path to input CSV file
+		use_mlp: Whether to use MLP conditional compression (tree-based)
+		use_mlp_autoregressive: Whether to use fully autoregressive MLP (p(x_j | x_<j))
+		verbose: Whether to print progress messages
+		
+	Returns:
+		Dictionary with keys:
+			- no_mlp: dict with baseline results
+			- mlp: dict with MLP results (conditional or autoregressive based on flag)
+	"""
+	"""
+	Benchmark a single file and return results as a dictionary.
+	
+	Args:
+		input_file: Path to input CSV file
+		use_mlp: Whether to use MLP conditional compression
+		use_mlp_autoregressive: Whether to use MLP autoregressive compression
+		verbose: Whether to print progress messages
+		
+	Returns:
+		Dictionary with keys:
+			- success: bool
+			- original_size: int (bytes)
+			- compressed_size: int (bytes)
+			- compression_ratio: float
+			- compress_time: float (seconds)
+			- decompress_time: float (seconds)
+			- roundtrip_ok: bool
+			- error: str (if success=False)
+	"""
+	if verbose:
+		print(f"\n{'='*60}")
+		print(f"Benchmarking: {input_file.name}")
+		print(f"{'='*60}\n")
+	
+	# Test without MLP
+	if verbose:
+		print("1. Testing without MLP (histogram-based)...")
+	result_no_mlp = run_benchmark(input_file, use_mlp=False)
+	
+	if result_no_mlp["success"]:
+		if verbose:
+			print(f"   ✓ Compression successful")
+			print(f"   Size: {format_size(result_no_mlp['compressed_size'])} "
+			      f"(ratio x{result_no_mlp['compression_ratio']:.2f})")
+			print(f"   Time: {result_no_mlp['compress_time']:.3f}s")
+	else:
+		if verbose:
+			print(f"   ✗ Compression failed: {result_no_mlp.get('error', 'Unknown error')}")
+	
+	# Test with MLP (conditional or autoregressive based on flag)
+	if use_mlp_autoregressive:
+		if verbose:
+			print("\n2. Testing with MLP extension (fully autoregressive: p(x_j | x_<j))...")
+		result_mlp = run_benchmark(input_file, use_mlp_autoregressive=True)
+	else:
+		if verbose:
+			print("\n2. Testing with MLP extension (conditional: p(child | parent))...")
+		result_mlp = run_benchmark(input_file, use_mlp=True)
+	
+	if result_mlp["success"]:
+		if verbose:
+			print(f"   ✓ Compression successful")
+			print(f"   Size: {format_size(result_mlp['compressed_size'])} "
+			      f"(ratio x{result_mlp['compression_ratio']:.2f})")
+			print(f"   Time: {result_mlp['compress_time']:.3f}s")
+		
+		# Compare
+		if result_no_mlp["success"]:
+			size_diff = result_mlp['compressed_size'] - result_no_mlp['compressed_size']
+			size_diff_pct = (size_diff / result_no_mlp['compressed_size']) * 100
+			time_diff = result_mlp['compress_time'] - result_no_mlp['compress_time']
+			time_diff_pct = (time_diff / result_no_mlp['compress_time']) * 100
+			
+			if verbose:
+				print(f"\n   Comparison:")
+				print(f"   Size change: {size_diff:+.0f} bytes ({size_diff_pct:+.2f}%)")
+				print(f"   Time change: {time_diff:+.3f}s ({time_diff_pct:+.2f}%)")
+	else:
+		if verbose:
+			print(f"   ✗ Compression failed: {result_mlp.get('error', 'Unknown error')}")
+	
+	# Return combined results
+	return {
+		"no_mlp": result_no_mlp,
+		"mlp": result_mlp,
+	}
+
+
 def main():
 	"""Main benchmark function."""
 	if len(sys.argv) < 2:
@@ -166,17 +258,13 @@ def main():
 			print(f"   Size: {format_size(result_no_mlp['compressed_size'])} "
 			      f"(ratio x{result_no_mlp['compression_ratio']:.2f})")
 			print(f"   Time: {result_no_mlp['compress_time']:.3f}s")
-			print(f"   Roundtrip: {'✓' if result_no_mlp['roundtrip_ok'] else '✗'}")
+			# print(f"   Roundtrip: {'✓' if result_no_mlp['roundtrip_ok'] else '✗'}")
 		else:
 			print(f"   ✗ Compression failed: {result_no_mlp.get('error', 'Unknown error')}")
 		
 		# Test with MLP (conditional)
-		print("\n2. Testing with MLP extension (conditional)...")
+		print("\n2. Testing with MLP extension (conditional: p(child | parent))...")
 		result_mlp = run_benchmark(input_file, use_mlp=True)
-		
-		# Test with autoregressive MLP
-		print("\n3. Testing with MLP extension (autoregressive)...")
-		result_mlp_ar = run_benchmark(input_file, use_mlp_autoregressive=True)
 		
 		if result_mlp["success"]:
 			print(f"   ✓ Compression successful")
@@ -198,6 +286,28 @@ def main():
 		else:
 			print(f"   ✗ Compression failed: {result_mlp.get('error', 'Unknown error')}")
 		
+		# Test with autoregressive MLP
+		# print("\n3. Testing with MLP extension (fully autoregressive: p(x_j | x_<j))...")
+		# result_mlp_ar = run_benchmark(input_file, use_mlp_autoregressive=True)
+		# if result_mlp_ar["success"]:
+		# 	print(f"   ✓ Compression successful")
+		# 	print(f"   Size: {format_size(result_mlp_ar['compressed_size'])} "
+		# 	      f"(ratio x{result_mlp_ar['compression_ratio']:.2f})")
+		# 	print(f"   Time: {result_mlp_ar['compress_time']:.3f}s")
+		# 	print(f"   Roundtrip: {'✓' if result_mlp_ar['roundtrip_ok'] else '✗'}")
+			
+		# 	# Compare
+		# 	if result_no_mlp["success"]:
+		# 		size_diff_ar = result_mlp_ar['compressed_size'] - result_no_mlp['compressed_size']
+		# 		size_diff_ar_pct = (size_diff_ar / result_no_mlp['compressed_size']) * 100
+		# 		time_diff_ar = result_mlp_ar['compress_time'] - result_no_mlp['compress_time']
+		# 		time_diff_ar_pct = (time_diff_ar / result_no_mlp['compress_time']) * 100
+				
+		# 		print(f"\n   Comparison (autoregressive):")
+		# 		print(f"   Size change: {size_diff_ar:+.0f} bytes ({size_diff_ar_pct:+.2f}%)")
+		# 		print(f"   Time change: {time_diff_ar:+.3f}s ({time_diff_ar_pct:+.2f}%)")
+		# else:
+		# 	print(f"   ✗ Compression failed: {result_mlp_ar.get('error', 'Unknown error')}")
 		# Store results
 		results.append({
 			"file": input_file.name,
@@ -209,14 +319,14 @@ def main():
 			"mlp_ratio": result_mlp.get("compression_ratio", 0),
 			"mlp_time": result_mlp.get("compress_time", 0),
 			"mlp_roundtrip": result_mlp.get("roundtrip_ok", False),
-			"mlp_ar_size": result_mlp_ar.get("compressed_size", 0),
-			"mlp_ar_ratio": result_mlp_ar.get("compression_ratio", 0),
-			"mlp_ar_time": result_mlp_ar.get("compress_time", 0),
-			"mlp_ar_roundtrip": result_mlp_ar.get("roundtrip_ok", False),
-			"size_diff": result_mlp.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
-			"time_diff": result_mlp.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
-			"size_diff_ar": result_mlp_ar.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
-			"time_diff_ar": result_mlp_ar.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
+			# "mlp_ar_size": result_mlp_ar.get("compressed_size", 0),
+			# "mlp_ar_ratio": result_mlp_ar.get("compression_ratio", 0),
+			# "mlp_ar_time": result_mlp_ar.get("compress_time", 0),
+			# "mlp_ar_roundtrip": result_mlp_ar.get("roundtrip_ok", False),
+			# "size_diff": result_mlp.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
+			# "time_diff": result_mlp.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
+			# "size_diff_ar": result_mlp_ar.get("compressed_size", 0) - result_no_mlp.get("compressed_size", 0),
+			# "time_diff_ar": result_mlp_ar.get("compress_time", 0) - result_no_mlp.get("compress_time", 0),
 		})
 	
 	# Write results to CSV

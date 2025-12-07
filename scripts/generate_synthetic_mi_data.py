@@ -15,19 +15,19 @@ except ImportError:
 
 def generate_correlated_data(n_rows: int, mi_target: float, seed: int = 0):
     """
-	Generate two discrete columns with roughly the desired MI (in bits).
+    Generate two discrete columns with roughly the desired MI (in bits).
     """
     np.random.seed(seed)
     
-	# Parent is uniform categorical.
-	n_parent_values = 20
+    # Parent is uniform categorical.
+    n_parent_values = 20
     parent = np.random.randint(0, n_parent_values, size=n_rows)
     
-	# Child is a noisy function of parent: deterministic with prob 1 - noise_prob,
-	# random otherwise.
+    # Child is a noisy function of parent: deterministic with prob 1 - noise_prob,
+    # random otherwise.
     n_child_values = 20
     
-	# Estimate noise probability from target MI.
+    # Estimate noise probability from target MI.
     max_mi = np.log2(min(n_parent_values, n_child_values))
     if mi_target >= max_mi:
         noise_prob = 0.0  # Fully deterministic
@@ -53,7 +53,7 @@ def generate_correlated_data(n_rows: int, mi_target: float, seed: int = 0):
 
 def generate_linear_correlated_data(n_rows: int, correlation: float, seed: int = 0):
     """
-	Generate two numeric columns with the given Pearson correlation coefficient.
+    Generate two numeric columns with the given Pearson correlation coefficient.
     """
     np.random.seed(seed)
     

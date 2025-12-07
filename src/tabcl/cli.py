@@ -966,7 +966,7 @@ def _prepare_raw_to_csv(input_path: Path, output_path: Path, header: bool | None
 	output_path.write_text(df.to_csv(index=False))
 
 
-def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False, use_line_graph: bool = False) -> None:
+def compress_file(input_path: str, output_path: str, delimiter: str, rare_threshold: int = 1, mi_mode: str = "exact", mi_buckets: int = 4096, mi_sample: int | None = None, mi_seed: int = 0, workers: int | None = None, use_mlp: bool = False, use_neural: bool = False, use_line_graph: bool = False, use_mlp_autoregressive: bool = False) -> None:
 	import time
 	profiler = {}  # Track time spent in each stage
 	total_start = time.time()
@@ -1279,7 +1279,20 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 	mlp_models: List[Optional[bytes]]
 	neural_metadata: Optional[Dict[str, Any]] = None
 	
-	if use_neural:
+	if use_mlp_autoregressive:
+		from .mlp_autoregressive import encode_columns_autoregressive
+		# Fully autoregressive MLP: p(x_j | x_<j) for most recent columns
+		# Limit to 8 parents max for speed, with adaptive training parameters
+		frames, mlp_models = encode_columns_autoregressive(
+			indices, dicts, 
+			embedding_dim=4, 
+			hidden_dims=[16], 
+			num_epochs=15,  # Reduced from 20
+			max_samples=30000,  # Reduced from 50000
+			max_parents=8  # Limit to 8 most recent columns
+		)
+		neural_metadata = None
+	elif use_neural:
 		from .neural_compression import encode_columns_neural
 		# Neural compression: uses same forest structure as histogram approach
 		frames, mlp_models, neural_metadata = encode_columns_neural(
@@ -1287,11 +1300,12 @@ def compress_file(input_path: str, output_path: str, delimiter: str, rare_thresh
 		)
 	else:
 		frames, mlp_models = encode_columns_with_parents(indices, parents, dicts, workers=workers or 1, use_mlp=use_mlp)
+		neural_metadata = None
 	
 	profiler["encode_columns"] = time.time() - stage_start
 	
 	# Update model with MLP models and re-serialize
-	if use_mlp or use_neural:
+	if use_mlp or use_neural or use_mlp_autoregressive:
 		model.mlp_models = mlp_models
 		model_bytes = model.to_bytes()
 	
@@ -1431,6 +1445,15 @@ def decompress_file(input_path: str, output_path: str) -> None:
 		raise RuntimeError("Could not determine row count")
 
 	# Decode columns
+	# Check if autoregressive MLP was used (check for ARMLP marker)
+	use_autoregressive = False
+	if frames and len(frames) > 0:
+		# Check if any frame has ARMLP marker
+		for frame in frames:
+			if len(frame) >= 6 and frame[:6] == b"ARMLP\x00":
+				use_autoregressive = True
+				break
+	
 	# Check if neural compression was used
 	use_neural = False
 	neural_metadata = None
@@ -1442,7 +1465,10 @@ def decompress_file(input_path: str, output_path: str) -> None:
 			neural_metadata = json.loads(neural_metadata_str)
 			break
 	
-	if use_neural and neural_metadata:
+	if use_autoregressive:
+		from .mlp_autoregressive import decode_columns_autoregressive
+		indices = decode_columns_autoregressive(frames, model.mlp_models or [], n_rows, max_parents=8)
+	elif use_neural and neural_metadata:
 		from .neural_compression import decode_columns_neural
 		indices = decode_columns_neural(frames, model.mlp_models or [], neural_metadata, n_rows)
 	else:
@@ -1714,6 +1740,7 @@ def main() -> None:
 	pc.add_argument("--mi-seed", type=int, default=0, help="Random seed for MI sampling")
 	pc.add_argument("--workers", type=int, default=None, help="Parallel workers for column/bucket compression")
 	pc.add_argument("--use-mlp", action="store_true", help="Use tiny MLP models for conditional compression (experimental)")
+	pc.add_argument("--use-mlp-autoregressive", action="store_true", help="Use fully autoregressive MLP: p(x_j | x_<j) for all previous columns")
 	pc.add_argument("--use-neural", action="store_true", help="Use neural autoregressive compression (fully ML-based)")
 	pc.add_argument("--use-line-graph", action="store_true", help="Use line graph baseline (sequential chain) instead of learned tree")
 
@@ -1726,7 +1753,7 @@ def main() -> None:
 	if args.cmd == "prepare":
 		_prepare_raw_to_csv(Path(args.input), Path(args.output), header=args.has_header)
 	elif args.cmd == "compress":
-		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural, use_line_graph=args.use_line_graph)
+		compress_file(args.input, args.output, args.delimiter, rare_threshold=args.rare_threshold, mi_mode=args.mi_mode, mi_buckets=args.mi_buckets, mi_sample=args.mi_sample, mi_seed=args.mi_seed, workers=args.workers, use_mlp=args.use_mlp, use_neural=args.use_neural, use_line_graph=args.use_line_graph, use_mlp_autoregressive=args.use_mlp_autoregressive)
 	elif args.cmd == "decompress":
 		decompress_file(args.input, args.output)
 	else:

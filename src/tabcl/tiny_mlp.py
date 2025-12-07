@@ -292,14 +292,16 @@ def train_tiny_mlp(
 		parent_tensors = [torch.from_numpy(parent_mapped).long().to(device)]
 		child_tensor = torch.from_numpy(child_mapped).long().to(device)
 	
-	# Training
-	optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+	# Training with improved hyperparameters
+	optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 	criterion = nn.CrossEntropyLoss()
-	scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+	scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
 	
 	model.train()
 	n_samples = len(child_tensor)
 	best_loss = float('inf')
+	patience_counter = 0
+	max_patience = 5  # Stop if no improvement for 5 epochs
 	
 	for epoch in range(num_epochs):
 		# Shuffle
@@ -320,6 +322,8 @@ def train_tiny_mlp(
 			logits = model.forward(parent_batches)
 			loss = criterion(logits, child_batch)
 			loss.backward()
+			# Gradient clipping to prevent instability
+			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 			
 			epoch_loss += loss.item()
@@ -328,11 +332,14 @@ def train_tiny_mlp(
 		avg_loss = epoch_loss / n_batches if n_batches > 0 else epoch_loss
 		scheduler.step(avg_loss)
 		
-		# Early stopping if loss stops improving
-		if avg_loss < best_loss:
+		# Early stopping with patience
+		if avg_loss < best_loss * 0.999:  # Require at least 0.1% improvement
 			best_loss = avg_loss
-		elif epoch > 5 and avg_loss >= best_loss * 1.01:  # Loss increased by 1%
-			break
+			patience_counter = 0
+		else:
+			patience_counter += 1
+			if epoch > 5 and patience_counter >= max_patience:
+				break
 	
 	# Store mapping for decoding
 	model.parent_map = parent_map
