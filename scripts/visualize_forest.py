@@ -2,13 +2,9 @@ import argparse
 import sys
 from pathlib import Path
 
-try:
-    import matplotlib.pyplot as plt
-    import networkx as nx
-    import numpy as np
-except ImportError:
-    print("Error: matplotlib, networkx, and numpy are required. Install with: pip install matplotlib networkx numpy", file=sys.stderr)
-    sys.exit(1)
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
 
 # Add parent directory to path to import tabcl.
 sys.path.insert(0, str(Path(__file__).parent.parent))

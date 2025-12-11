@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Wrapper script to run bench.py on all datasets and collect results.
-Writes results to results/base_sweep.csv
-"""
-
 import argparse
 import csv
 import re

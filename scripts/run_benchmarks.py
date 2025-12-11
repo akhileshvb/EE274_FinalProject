@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-"""
-Run benchmarks on all datasets and write results to CSV.
-"""
 import argparse
 import csv
 import os

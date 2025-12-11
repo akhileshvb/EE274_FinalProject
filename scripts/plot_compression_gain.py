@@ -1,8 +1,3 @@
-"""
-Plot compression gain vs mutual information for parent-child column pairs.
-Shows how compression benefit correlates with statistical dependence.
-"""
-
 import argparse
 import sys
 from pathlib import Path

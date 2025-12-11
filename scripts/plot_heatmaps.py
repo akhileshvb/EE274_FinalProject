@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-"""
-Generate heatmap visualizations for tabcl compression analysis.
-"""
 import argparse
 import csv
 import sys
@@ -12,23 +8,13 @@ import base64
 import subprocess
 import tempfile
 
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import seaborn as sns
-    import pandas as pd
-except ImportError:
-    print("Error: matplotlib, numpy, seaborn, and pandas are required. Install with: pip install matplotlib numpy seaborn pandas", file=sys.stderr)
-    sys.exit(1)
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+import pandas as pd
 
-# Import tabcl to read model data
-try:
-    from tabcl.cli import Model
-    from tabcl.mi import compute_empirical_mi, compute_hashed_mi
-except ImportError:
-    print("Error: tabcl module not found. Make sure you're in the project directory.", file=sys.stderr)
-    sys.exit(1)
-
+from tabcl.cli import Model
+from tabcl.mi import compute_empirical_mi, compute_hashed_mi
 
 def load_results(csv_file: Path) -> List[Dict]:
     """Load results from CSV file."""

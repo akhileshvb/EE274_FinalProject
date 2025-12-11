@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Benchmark script comparing tabcl with and without MLP extension.
-"""
-
 import subprocess
 import sys
 import time

@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Plot benchmark results from CSV - compression ratios and speeds.
-Creates separate plots for compression ratio and compression time.
-"""
 import argparse
 import csv
 import sys

@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""
-Plot comparison between MLP and histogram-based conditional distributions.
-Shows why MLP performs better by visualizing how it smooths/interpolates distributions.
-"""
 import argparse
 import sys
 from pathlib import Path
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    import numpy as np
-    import pandas as pd
-except ImportError:
-    print("Error: matplotlib, numpy, and pandas are required.", file=sys.stderr)
-    sys.exit(1)
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+import pandas as pd
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))

@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Convert a parquet file to CSV format.
-"""
-
 import argparse
 import pandas as pd
 from pathlib import Path

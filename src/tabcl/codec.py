@@ -5,9 +5,9 @@ import threading
 from collections import Counter
 
 try:
-	import openzl.ext as zl  # type: ignore
+	import openzl.ext as zl  
 except Exception:
-	zl = None  # type: ignore
+	zl = None  
 
 
 def histogram_from_pairs(x: Iterable[Any], y: Iterable[Any]) -> Dict[Tuple[Any, Any], int]:

@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Advanced plots for tabcl compression analysis.
-Extracts statistics from compressed files and creates visualizations.
-"""
 import argparse
 import csv
 import sys

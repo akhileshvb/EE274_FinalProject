@@ -69,13 +69,12 @@ def run(cmd: list[str], parse_profiler: bool = False) -> float:
 				error_msg += f": {result.stderr[:500]}"
 			raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
 		
-		# Try to parse profiler output for "Total time"
-		import re
-		# Look for "Total time: X.XXXs" in the output (check both stdout and stderr)
-		output = result.stdout + result.stderr
-		match = re.search(r'Total time:\s+([\d.]+)s', output)
-		if match:
-			return float(match.group(1))
+		
+		# import re
+		# output = result.stdout + result.stderr
+		# match = re.search(r'Total time:\s+([\d.]+)s', output)
+		# if match:
+		# 	return float(match.group(1))
 		return wall_time
 	else:
 		subprocess.run(cmd, check=True)

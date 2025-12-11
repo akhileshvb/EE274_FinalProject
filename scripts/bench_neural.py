@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Benchmark script comparing histogram-based compression with neural autoregressive compression.
-"""
-
 import subprocess
 import sys
 import time

@@ -1,5 +1,3 @@
-"""MLP-based conditional encoding and decoding of columns."""
-
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import struct

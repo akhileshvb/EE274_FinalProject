@@ -1,5 +1,3 @@
-"""Experimental neural compressor for tabular data using MLPs."""
-
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import struct

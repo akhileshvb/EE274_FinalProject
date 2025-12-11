@@ -1,8 +1,3 @@
-"""
-Analyze the results from the synthetic MI experiment.
-Computes actual MI values and compares with compression gains.
-"""
-
 import argparse
 import sys
 from pathlib import Path

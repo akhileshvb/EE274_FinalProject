@@ -1,9 +1,3 @@
-"""
-Run synthetic dataset experiments with varying correlation levels.
-Generates multiple datasets with different correlation strengths, runs compression benchmarks,
-and writes results to CSV.
-"""
-
 import argparse
 import sys
 import subprocess
