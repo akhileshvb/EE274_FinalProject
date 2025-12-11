@@ -44,7 +44,7 @@ By default, `tabcl`:
 
 ```bash
 # Compress using histogram-based approach (default)
-tabcl compress --input datasets/us_census_data_1990/USCensus1990_sample.csv --output us_census.tabcl --delimiter ,
+tabcl compress --input datasets/us_census_data_1990/USCensus1990_FULL.csv --output us_census.tabcl --delimiter ,
 
 # Decompress
 tabcl decompress --input us_census.tabcl --output us_census_restored.csv
