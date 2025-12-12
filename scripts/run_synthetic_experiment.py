@@ -23,8 +23,8 @@ def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",",
                   zstd_level: int = 4, mi_mode: str = "auto", workers: int = None):
     """
     Run compression benchmark on a CSV file and return results.
-    Tests: tabcl (histogram), tabcl (MLP conditional), tabcl (line graph),
-           gzip, zstd, bzip2, columnar gzip, columnar zstd.
+    Tests: tabcl (histogram), tabcl (line graph), gzip, zstd, bzip2, 
+           columnar gzip, columnar zstd.
     
     Returns:
         Dictionary with compression results (size, time, ratio, throughput) for each method
@@ -84,14 +84,6 @@ def run_benchmark(csv_file: Path, outdir: Path, delimiter: str = ",",
     results['tabcl_size'] = tabcl_size
     results['tabcl_ratio'] = orig_size / tabcl_size if tabcl_size else None
     results['tabcl_throughput'] = (orig_size / tabcl_time / (1024 * 1024)) if tabcl_time else None
-    
-    # tabcl (MLP conditional)
-    tabcl_mlp_out = outdir / (csv_file.stem + ".tabcl_mlp")
-    tabcl_mlp_time, tabcl_mlp_size = run_tabcl_compress(csv_file, tabcl_mlp_out, ["--use-mlp"])
-    results['tabcl_mlp_time'] = tabcl_mlp_time
-    results['tabcl_mlp_size'] = tabcl_mlp_size
-    results['tabcl_mlp_ratio'] = orig_size / tabcl_mlp_size if tabcl_mlp_size else None
-    results['tabcl_mlp_throughput'] = (orig_size / tabcl_mlp_time / (1024 * 1024)) if tabcl_mlp_time else None
     
     # tabcl (line graph baseline)
     tabcl_line_out = outdir / (csv_file.stem + ".tabcl_line")
@@ -298,11 +290,10 @@ def plot_results(results_file: Path, output_file: Path = None):
     
     methods = [
         ('tabcl_ratio', 'tabcl (histogram)', 'steelblue', 'o-', 2.5),
-        ('tabcl_mlp_ratio', 'tabcl (MLP)', 'darkblue', 'o--', 2.5),
         ('tabcl_line_ratio', 'tabcl (line graph)', 'coral', 's--', 2),
-        ('gzip_ratio', 'gzip', 'green', '^-', 2),
-        ('zstd_ratio', 'zstd', 'purple', 'd-', 2),
         ('bzip2_ratio', 'bzip2', 'orange', 'v-', 2),
+        ('columnar_gzip_ratio', 'col-gzip', 'lightgreen', '^--', 2),
+        ('columnar_zstd_ratio', 'col-zstd', 'mediumpurple', 'd--', 2),
     ]
     
     for col, label, color, style, linewidth in methods:
@@ -461,8 +452,6 @@ Examples:
             # Print summary
             if results.get('tabcl_ratio'):
                 print(f"    tabcl (histogram): {results['tabcl_ratio']:.2f}x compression, {results.get('tabcl_time', 0):.2f}s")
-            if results.get('tabcl_mlp_ratio'):
-                print(f"    tabcl (MLP): {results['tabcl_mlp_ratio']:.2f}x compression, {results.get('tabcl_mlp_time', 0):.2f}s")
             if results.get('tabcl_line_ratio'):
                 print(f"    tabcl (line): {results['tabcl_line_ratio']:.2f}x compression, {results.get('tabcl_line_time', 0):.2f}s")
             if results.get('gzip_ratio'):
@@ -471,6 +460,10 @@ Examples:
                 print(f"    zstd: {results['zstd_ratio']:.2f}x compression, {results.get('zstd_time', 0):.2f}s")
             if results.get('bzip2_ratio'):
                 print(f"    bzip2: {results['bzip2_ratio']:.2f}x compression, {results.get('bzip2_time', 0):.2f}s")
+            if results.get('columnar_gzip_ratio'):
+                print(f"    col-gzip: {results['columnar_gzip_ratio']:.2f}x compression, {results.get('columnar_gzip_time', 0):.2f}s")
+            if results.get('columnar_zstd_ratio'):
+                print(f"    col-zstd: {results['columnar_zstd_ratio']:.2f}x compression, {results.get('columnar_zstd_time', 0):.2f}s")
         else:
             print(f"  Skipping benchmarks (--skip-benchmark)")
         
@@ -486,7 +479,6 @@ Examples:
             'correlation_strength', 'n_rows', 'n_columns', 'tree_depth', 'branches',
             'original_size', 'dataset_file',
             'tabcl_size', 'tabcl_time', 'tabcl_ratio', 'tabcl_throughput',
-            'tabcl_mlp_size', 'tabcl_mlp_time', 'tabcl_mlp_ratio', 'tabcl_mlp_throughput',
             'tabcl_line_size', 'tabcl_line_time', 'tabcl_line_ratio', 'tabcl_line_throughput',
             'gzip_size', 'gzip_time', 'gzip_ratio', 'gzip_throughput',
             'zstd_size', 'zstd_time', 'zstd_ratio', 'zstd_throughput',
