@@ -4,3 +4,4 @@ networkx>=3.0
 openzl>=0.1.0
 torch>=2.0.0
 matplotlib>=3.7
+pytest>=7.0

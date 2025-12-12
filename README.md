@@ -1,9 +1,13 @@
 # EE274 Final Project: Tabular Compression via MDL-weighted Chow–Liu using OpenZL
 
-This repository implements the core ideas of “Compressing Tabular Data via Pairwise Dependencies” (DCC 2017) using an MDL‑adjusted Chow–Liu forest, wired to the OpenZL Python API. The main focus is a practical implementation of the MDL criterion and forest learning for CSV files; the more experimental neural/MLP code is included as an optional aside.
+Modern data-driven applications generate vast quantities of structured, tabular data: logs, clickstreams, telemetry, financial records, and large public datasets such as census or environmental measurements. Storing and serving these datasets efficiently is a central systems concern. General-purpose compressors like gzip or zstd are ubiquitous and robust, but they treat the input as a flat byte stream and cannot fully exploit the rich statistical dependencies that exist across columns in a table. At the other extreme, columnar formats and database engines incorporate hand-crafted encodings and domain-specific logic, but these are often ad hoc, hard to reason about, and difficult to adapt automatically to new domains.
 
+This repository implements structure-aware lossless compression for tabular data using the **Minimum Description Length (MDL) principle** and Chow–Liu trees. MDL is an information-theoretic framework that selects models by minimizing the total code length needed to describe both the model and the data under that model—balancing model complexity against compression benefit. Our key idea is to treat compression as learning a probabilistic model over table columns and encoding data relative to that model: we learn a forest-structured graphical model whose edges capture high mutual-information dependencies, compress root columns with strong per-column numeric/categorical coders, and encode non-root columns conditionally on their parents.
+
+We implement two compression schemes: (1) a **histogram-based MDL-adjusted Chow–Liu compressor** building on Pavlichin et al. (DCC 2017), with algorithmic and systems-level optimizations including two-phase mutual information estimation with adaptive sampling, vectorized operations, parallelization, and specialized encoding schemes; and (2) a **lightweight MLP-based extension** that learns conditional distributions for high-cardinality dependencies via probability-weighted rank encoding. For most encoders, the implementation uses the OpenZL Python API.
+<!-- 
 - OpenZL repo: [facebook/openzl](https://github.com/facebook/openzl)  
-- OpenZL docs: [openzl.org](https://openzl.org/)
+- OpenZL docs: [openzl.org](https://openzl.org/) -->
 
 ## Quickstart
 
@@ -15,11 +19,11 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-If you built OpenZL from source, make sure this works inside the `tabcl` environment:
+<!-- If you built OpenZL from source, make sure this works inside the `tabcl` environment:
 
 ```python
 >>> import openzl.ext as zl
-```
+``` -->
 
 ## CLI
 

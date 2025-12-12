@@ -6,10 +6,16 @@ src/tabcl/codec.py
 src/tabcl/conditional.py
 src/tabcl/forest.py
 src/tabcl/mi.py
+src/tabcl/mlp_autoregressive.py
+src/tabcl/mlp_conditional.py
+src/tabcl/neural_compression.py
+src/tabcl/tiny_mlp.py
 src/tabcl.egg-info/PKG-INFO
 src/tabcl.egg-info/SOURCES.txt
 src/tabcl.egg-info/dependency_links.txt
 src/tabcl.egg-info/entry_points.txt
 src/tabcl.egg-info/requires.txt
 src/tabcl.egg-info/top_level.txt
+tests/test_mlp.py
 tests/test_roundtrip.py
+tests/test_tree_recovery.py
