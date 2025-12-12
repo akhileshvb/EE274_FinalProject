@@ -59,8 +59,8 @@ You can control a few knobs via the CLI, e.g.:
 - `--mi-mode {exact,hashed,auto}`: how mutual information is estimated.  
 - `--rare-threshold`: how aggressively to factor out rare categorical values.  
 - `--workers`: number of threads used during MI and encoding.
-
-See `scripts/bench.py` for examples of running consistent benchmarks across multiple compressors.
+<!-- 
+See `scripts/bench.py` for examples of running consistent benchmarks across multiple compressors. -->
 
 ## MLP Extensions
 
